@@ -39,7 +39,15 @@ for (const sql of [
   `ALTER TABLE reminders ADD COLUMN advance_notice_hours INTEGER`,
   `ALTER TABLE reminders ADD COLUMN notification_target TEXT NOT NULL DEFAULT 'dm'`,
 ]) {
-  try { db.exec(sql); } catch (_) { /* already exists */ }
+  try { db.exec(sql); } catch (err) {
+    if (!err.message.includes('duplicate column name')) throw err;
+  }
+}
+
+function toUtcISO(dateStr) {
+  const d = new Date(dateStr);
+  if (isNaN(d.getTime())) throw new Error(`Invalid date: ${dateStr}`);
+  return d.toISOString();
 }
 
 // ── Settings ─────────────────────────────────────────────────────────────────
@@ -72,7 +80,7 @@ function createReminder({ task, assigneeName, assigneeSlackUserId, dueAt, source
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, 0, ?, ?, ?, ?)
   `).run(
     id, task, assigneeName, assigneeSlackUserId,
-    new Date(dueAt).toISOString(),
+    toUtcISO(dueAt),
     sourceChannelId, sourceMessageTs, sourceThreadTs,
     createdBy, confidence,
     advanceNoticeHours ?? null,
@@ -97,14 +105,6 @@ function findByConfirmationTs(channelId, messageTs) {
     SELECT * FROM reminders
     WHERE source_channel_id = ? AND confirmation_message_ts = ?
     AND status IN ('draft', 'pending', 'cancelled')
-  `).get(channelId, messageTs);
-}
-
-// Legacy alias
-function findDraftByConfirmationTs(channelId, messageTs) {
-  return db.prepare(`
-    SELECT * FROM reminders
-    WHERE source_channel_id = ? AND confirmation_message_ts = ? AND status = 'draft'
   `).get(channelId, messageTs);
 }
 
@@ -178,7 +178,7 @@ function updateReminder(id, { assigneeName, assigneeSlackUserId, dueAt } = {}) {
   const values = [];
   if (assigneeName !== undefined)        { fields.push('assignee_name = ?');          values.push(assigneeName); }
   if (assigneeSlackUserId !== undefined)  { fields.push('assignee_slack_user_id = ?'); values.push(assigneeSlackUserId); }
-  if (dueAt !== undefined)               { fields.push('due_at = ?');                 values.push(new Date(dueAt).toISOString()); }
+  if (dueAt !== undefined)               { fields.push('due_at = ?');                 values.push(toUtcISO(dueAt)); }
   if (fields.length === 0) return;
   fields.push('updated_at = ?');
   values.push(now, id);
@@ -195,7 +195,6 @@ module.exports = {
   setNotificationTarget,
   setConfirmationTs,
   findByConfirmationTs,
-  findDraftByConfirmationTs,
   approveReminder,
   cancelReminder,
   restoreReminder,

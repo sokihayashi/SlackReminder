@@ -1,5 +1,5 @@
 const { findByConfirmationTs, approveReminder, cancelReminder, restoreReminder } = require('../db');
-const { formatDueAt } = require('../utils');
+const { formatDueAt, displayAssignee } = require('../utils');
 const botConfig = require('../botConfig');
 
 async function handleReaction({ event, client }) {
@@ -12,9 +12,7 @@ async function handleReaction({ event, client }) {
   const reminder = findByConfirmationTs(item.channel, item.ts);
   if (!reminder) return;
 
-  const assigneeDisplay = reminder.assignee_slack_user_id
-    ? `<@${reminder.assignee_slack_user_id}>`
-    : reminder.assignee_name;
+  const assigneeDisplay = displayAssignee(reminder);
 
   if (reaction === 'white_check_mark') {
     if (reminder.status === 'draft') {
