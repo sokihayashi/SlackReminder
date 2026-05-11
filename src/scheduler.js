@@ -1,5 +1,5 @@
 const cron = require('node-cron');
-const { getPendingDueReminders, getUnnotifiedPendingReminders, markSent, markFailed, markAdvanceNotified, getSetting } = require('./db');
+const { getPendingDueReminders, getUnnotifiedPendingReminders, getAllPending, markSent, markFailed, markAdvanceNotified, getSetting } = require('./db');
 const { formatDueAt, DEFAULT_ADVANCE_NOTICE_HOURS } = require('./utils');
 
 function startScheduler(client) {
@@ -7,6 +7,11 @@ function startScheduler(client) {
     await processAdvanceNotices(client);
     await processDueReminders(client);
   });
+
+  // 毎週月曜 9:00 JST (= 0:00 UTC)
+  cron.schedule('0 0 * * 1', async () => {
+    await postWeeklySummary(client);
+  }, { timezone: 'Asia/Tokyo' });
 
   console.log('[scheduler] Started — checking every minute');
 }
@@ -83,6 +88,49 @@ async function processDueReminders(client) {
       markFailed(reminder.id);
     }
   }
+}
+
+async function postWeeklySummary(client) {
+  const channelId = getSetting('summary_channel_id', '');
+  if (!channelId) return;
+
+  const reminders = getAllPending();
+  const today = new Date().toLocaleDateString('ja-JP', { timeZone: 'Asia/Tokyo', year: 'numeric', month: 'long', day: 'numeric', weekday: 'long' });
+
+  if (reminders.length === 0) {
+    await client.chat.postMessage({
+      channel: channelId,
+      text: `📋 *週次タスクサマリー（${today}）*\n\n現在ペンディング中のタスクはありません。`,
+    });
+    return;
+  }
+
+  const lines = reminders.map((r, i) => {
+    const assignee = r.assignee_slack_user_id ? `<@${r.assignee_slack_user_id}>` : r.assignee_name;
+    const statusLabel = r.status === 'draft' ? '⏳未確認' : '✅確認済み';
+    return `${i + 1}. *${r.task}*\n　担当：${assignee}　期限：${formatDueAt(r.due_at)}　${statusLabel}`;
+  });
+
+  await client.chat.postMessage({
+    channel: channelId,
+    text: `📋 *週次タスクサマリー（${today}）*\n\n${lines.join('\n\n')}`,
+    blocks: [
+      {
+        type: 'header',
+        text: { type: 'plain_text', text: `📋 週次タスクサマリー（${today}）` },
+      },
+      {
+        type: 'section',
+        text: { type: 'mrkdwn', text: lines.join('\n\n') },
+      },
+      {
+        type: 'context',
+        elements: [{ type: 'mrkdwn', text: `合計 ${reminders.length} 件のペンディングタスク` }],
+      },
+    ],
+  });
+
+  console.log(`[scheduler] Weekly summary posted to ${channelId} (${reminders.length} tasks)`);
 }
 
 module.exports = { startScheduler };
