@@ -1,6 +1,7 @@
 const { extractReminder } = require('../ai');
-const { createReminder, setConfirmationTs } = require('../db');
+const { createReminder, setConfirmationTs, getAllPending, getPendingByAssignee } = require('../db');
 const { formatDueAt } = require('../utils');
+const botConfig = require('../botConfig');
 
 async function handleMention({ event, client }) {
   const { text, channel, ts, thread_ts, user } = event;
@@ -9,7 +10,27 @@ async function handleMention({ event, client }) {
   console.log(`[mention] received from user=${user} channel=${channel} text=${text}`);
 
   try {
-    const extraction = await extractReminder(text);
+    // Fetch thread context when mentioned inside an existing thread
+    let threadMessages = [];
+    if (thread_ts) {
+      try {
+        const result = await client.conversations.replies({ channel, ts: thread_ts, limit: 10 });
+        threadMessages = (result.messages || [])
+          .filter(m => m.user && m.user !== botConfig.botUserId && m.ts !== ts)
+          .slice(-5)
+          .map(m => ({ user: m.user, text: m.text }));
+      } catch (e) {
+        console.error('[mention] Failed to fetch thread context:', e.message);
+      }
+    }
+
+    const extraction = await extractReminder(text, new Date(), threadMessages);
+
+    // Handle task list query
+    if (extraction.intent === 'query_tasks') {
+      await handleTaskQuery(extraction, channel, replyThreadTs, client);
+      return;
+    }
 
     if (!extraction.should_create_reminder) {
       await client.chat.postMessage({
@@ -20,7 +41,6 @@ async function handleMention({ event, client }) {
       return;
     }
 
-    // Ask for clarification when confidence is low or required fields are missing
     if (extraction.confidence < 0.6 || (extraction.missing_fields && extraction.missing_fields.length > 0)) {
       const missing = extraction.missing_fields && extraction.missing_fields.length > 0
         ? extraction.missing_fields.join('、')
@@ -60,7 +80,7 @@ async function handleMention({ event, client }) {
     const confirmMsg = await client.chat.postMessage({
       channel,
       thread_ts: replyThreadTs,
-      text: `リマインド候補を作成しました。\n\n担当：${assigneeDisplay}\n期限：${dueDisplay}\n内容：${extraction.task}\n\n✅ 登録 / ❌ 無視`,
+      text: `リマインド候補を作成しました。\n\n担当：${assigneeDisplay}\n期限：${dueDisplay}\n内容：${extraction.task}\n\n✅ 登録 / ❌ キャンセル`,
       blocks: [
         {
           type: 'section',
@@ -74,7 +94,7 @@ async function handleMention({ event, client }) {
           elements: [
             {
               type: 'mrkdwn',
-              text: `確信度：${Math.round(extraction.confidence * 100)}%　|　✅ でリアクションすると登録、❌ でキャンセル`,
+              text: `確信度：${Math.round(extraction.confidence * 100)}%　|　✅ 登録　❌ キャンセル　※スレッドに返信で内容修正も可`,
             },
           ],
         },
@@ -83,7 +103,6 @@ async function handleMention({ event, client }) {
 
     setConfirmationTs(reminderId, confirmMsg.ts);
 
-    // Add reaction affordances so users see them immediately
     await client.reactions.add({ channel, timestamp: confirmMsg.ts, name: 'white_check_mark' });
     await client.reactions.add({ channel, timestamp: confirmMsg.ts, name: 'x' });
   } catch (err) {
@@ -94,6 +113,40 @@ async function handleMention({ event, client }) {
       text: 'エラーが発生しました。しばらく後にもう一度お試しください。',
     });
   }
+}
+
+async function handleTaskQuery(extraction, channel, replyThreadTs, client) {
+  const queryUserId = (() => {
+    if (!extraction.query_assignee) return null;
+    const m = extraction.query_assignee.match(/^<@(U[A-Z0-9]+)>$/) ||
+              extraction.query_assignee.match(/^(U[A-Z0-9]{6,})$/);
+    return m ? m[1] : null;
+  })();
+
+  const reminders = queryUserId ? getPendingByAssignee(queryUserId) : getAllPending();
+  const headerText = queryUserId ? `<@${queryUserId}> のタスク一覧` : 'ペンディングタスク一覧';
+
+  if (reminders.length === 0) {
+    await client.chat.postMessage({
+      channel,
+      thread_ts: replyThreadTs,
+      text: `*${headerText}*\n\n現在ペンディング中のタスクはありません。`,
+    });
+    return;
+  }
+
+  const lines = reminders.map((r, i) => {
+    const assignee = r.assignee_slack_user_id ? `<@${r.assignee_slack_user_id}>` : r.assignee_name;
+    const due = formatDueAt(r.due_at);
+    const statusLabel = r.status === 'draft' ? '未確認' : '確認済み';
+    return `${i + 1}. *${r.task}*\n　担当：${assignee}　期限：${due}　[${statusLabel}]`;
+  });
+
+  await client.chat.postMessage({
+    channel,
+    thread_ts: replyThreadTs,
+    text: `*${headerText}*\n\n${lines.join('\n\n')}`,
+  });
 }
 
 module.exports = { handleMention };
