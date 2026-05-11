@@ -33,12 +33,13 @@ async function handleMention({ event, client }) {
       return;
     }
 
-    // Resolve Slack user ID from "<@U123456>" format if present
+    // Resolve Slack user ID — handle both "<@U123456>" and bare "U123456" forms
     let assigneeSlackUserId = null;
-    const assigneeName = extraction.assignee || '(未設定)';
-    const mentionMatch = assigneeName.match(/^<@(U[A-Z0-9]+)>$/);
+    let assigneeName = extraction.assignee || '(未設定)';
+    const mentionMatch = assigneeName.match(/^<@(U[A-Z0-9]+)>$/) || assigneeName.match(/^(U[A-Z0-9]{6,})$/);
     if (mentionMatch) {
       assigneeSlackUserId = mentionMatch[1];
+      assigneeName = `<@${assigneeSlackUserId}>`;
     }
 
     const reminderId = createReminder({
