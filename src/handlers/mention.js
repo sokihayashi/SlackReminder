@@ -4,8 +4,9 @@ const { formatDueAt } = require('../utils');
 
 async function handleMention({ event, client }) {
   const { text, channel, ts, thread_ts, user } = event;
-  // Replies go to the originating thread; top-level posts start a new thread
   const replyThreadTs = thread_ts || ts;
+
+  console.log(`[mention] received from user=${user} channel=${channel} text=${text}`);
 
   try {
     const extraction = await extractReminder(text);
