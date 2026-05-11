@@ -1,10 +1,10 @@
-const { extractReminder } = require('../ai');
+const { extractReminder, resolveCancelTarget } = require('../ai');
 const {
   createReminder, setConfirmationTs, setNotificationTarget,
   getAllPending, getPendingByAssignee, cancelReminder,
   getSetting, setSetting, getAllSettings,
 } = require('../db');
-const { formatDueAt, formatHours, CONFIDENCE_THRESHOLD, DEFAULT_ADVANCE_NOTICE_HOURS } = require('../utils');
+const { formatDueAt, formatHours, displayAssignee, CONFIDENCE_THRESHOLD, DEFAULT_ADVANCE_NOTICE_HOURS } = require('../utils');
 const botConfig = require('../botConfig');
 
 async function handleMention({ event, client }) {
@@ -26,7 +26,7 @@ async function handleMention({ event, client }) {
 
     switch (extraction.intent) {
       case 'query_tasks':           return handleTaskQuery(extraction, channel, replyThreadTs, client);
-      case 'cancel_reminder':       return handleCancelReminder(extraction, channel, replyThreadTs, client);
+      case 'cancel_reminder':       return handleCancelReminder(text, channel, replyThreadTs, client);
       case 'update_setting':        return handleUpdateSetting(extraction, channel, replyThreadTs, client);
       case 'set_summary_channel':   return handleSetSummaryChannel(channel, replyThreadTs, client);
       case 'remove_summary_channel':return handleRemoveSummaryChannel(channel, replyThreadTs, client);
@@ -133,7 +133,7 @@ async function handleTaskQuery(extraction, channel, replyThreadTs, client) {
   }
 
   const lines = reminders.map((r, i) => {
-    const assignee = r.assignee_slack_user_id ? `<@${r.assignee_slack_user_id}>` : r.assignee_name;
+    const assignee = displayAssignee(r);
     const statusLabel = r.status === 'draft' ? '未確認' : '確認済み';
     return `${i + 1}. *${r.task}*\n　担当：${assignee}　期限：${formatDueAt(r.due_at)}　[${statusLabel}]`;
   });
@@ -145,15 +145,10 @@ async function handleTaskQuery(extraction, channel, replyThreadTs, client) {
   });
 }
 
-async function handleCancelReminder(extraction, channel, replyThreadTs, client) {
-  const userId = extractUserId(extraction.cancel_assignee);
-  const hint = extraction.cancel_task_hint?.toLowerCase();
+async function handleCancelReminder(text, channel, replyThreadTs, client) {
+  const pending = getAllPending();
 
-  // 候補を絞り込む
-  let candidates = userId ? getPendingByAssignee(userId) : getAllPending();
-  if (hint) candidates = candidates.filter(r => r.task.toLowerCase().includes(hint));
-
-  if (candidates.length === 0) {
+  if (pending.length === 0) {
     await client.chat.postMessage({
       channel,
       thread_ts: replyThreadTs,
@@ -162,22 +157,33 @@ async function handleCancelReminder(extraction, channel, replyThreadTs, client) 
     return;
   }
 
-  if (candidates.length > 1) {
-    const lines = candidates.map((r, i) => {
-      const assignee = r.assignee_slack_user_id ? `<@${r.assignee_slack_user_id}>` : r.assignee_name;
+  const { reminder_id } = await resolveCancelTarget(text, pending);
+
+  if (!reminder_id) {
+    const lines = pending.map((r, i) => {
+      const assignee = displayAssignee(r);
       return `${i + 1}. *${r.task}*　担当：${assignee}　期限：${formatDueAt(r.due_at)}`;
     });
     await client.chat.postMessage({
       channel,
       thread_ts: replyThreadTs,
-      text: `複数のリマインドが見つかりました。どれをキャンセルするか確認メッセージの ❌ でお知らせください。\n\n${lines.join('\n')}`,
+      text: `キャンセル対象を特定できませんでした。確認メッセージの ❌ でキャンセルするか、もう少し詳しく教えてください。\n\n${lines.join('\n')}`,
     });
     return;
   }
 
-  const r = candidates[0];
+  const r = pending.find(p => p.id === reminder_id);
+  if (!r) {
+    await client.chat.postMessage({
+      channel,
+      thread_ts: replyThreadTs,
+      text: 'キャンセル対象のペンディングリマインドが見つかりませんでした。',
+    });
+    return;
+  }
+
   cancelReminder(r.id);
-  const assignee = r.assignee_slack_user_id ? `<@${r.assignee_slack_user_id}>` : r.assignee_name;
+  const assignee = displayAssignee(r);
   await client.chat.postMessage({
     channel,
     thread_ts: replyThreadTs,
@@ -191,7 +197,6 @@ async function handleUpdateSetting(extraction, channel, replyThreadTs, client) {
   if (key === 'advance_notice_hours') {
     const hours = parseInt(value, 10);
     if (Number.isFinite(hours) && hours >= 0) {
-      // 具体的な時間が指定された場合はすぐ保存
       setSetting('advance_notice_hours', String(hours));
       await client.chat.postMessage({
         channel,
@@ -199,7 +204,6 @@ async function handleUpdateSetting(extraction, channel, replyThreadTs, client) {
         text: `⚙️ 事前通知タイミングを *${formatHours(hours)}前* に設定しました。`,
       });
     } else {
-      // 時間が不明な場合はボタンを表示
       await postAdvanceNoticeButtons(channel, replyThreadTs, client);
     }
     return;
@@ -269,8 +273,8 @@ async function handleShowSettings(channel, replyThreadTs, client) {
 }
 
 function notificationTargetBlock(current) {
-  const dm = { type: 'button', text: { type: 'plain_text', text: '📱 DM' }, value: 'dm', action_id: 'set_notification_target' };
-  const thread = { type: 'button', text: { type: 'plain_text', text: '💬 スレッド' }, value: 'thread', action_id: 'set_notification_target' };
+  const dm = { type: 'button', text: { type: 'plain_text', text: '📱 DM' }, value: 'dm', action_id: 'set_notification_target__dm' };
+  const thread = { type: 'button', text: { type: 'plain_text', text: '💬 スレッド' }, value: 'thread', action_id: 'set_notification_target__thread' };
   if (current === 'dm') dm.style = 'primary';
   else thread.style = 'primary';
   return { type: 'actions', elements: [dm, thread] };
@@ -368,9 +372,9 @@ async function fetchThreadContext(client, channel, thread_ts, currentTs) {
   try {
     const result = await client.conversations.replies({ channel, ts: thread_ts, limit: 10 });
     return (result.messages || [])
-      .filter(m => m.user && m.user !== botConfig.botUserId && m.ts !== currentTs)
+      .filter(m => m.user && m.user !== botConfig.botUserId && m.ts !== currentTs && m.text)
       .slice(-5)
-      .map(m => ({ user: m.user, text: m.text }));
+      .map(m => ({ user: m.user, text: m.text.slice(0, 300) }));
   } catch (e) {
     console.error('[mention] Failed to fetch thread context:', e.message);
     return [];
@@ -390,4 +394,4 @@ function extractUserId(raw) {
   return m ? m[1] : null;
 }
 
-module.exports = { handleMention };
+module.exports = { handleMention, notificationTargetBlock };

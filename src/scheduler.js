@@ -1,6 +1,11 @@
 const cron = require('node-cron');
-const { getPendingDueReminders, getUnnotifiedPendingReminders, getAllPending, markSent, markFailed, markAdvanceNotified, getSetting } = require('./db');
-const { formatDueAt, formatHours, DEFAULT_ADVANCE_NOTICE_HOURS } = require('./utils');
+const { getPendingDueReminders, getUnnotifiedPendingReminders, getAllPending, markSent, markFailed, markAdvanceNotified, getSetting, setSetting } = require('./db');
+const { formatDueAt, formatHours, displayAssignee, DEFAULT_ADVANCE_NOTICE_HOURS } = require('./utils');
+
+const UNRECOVERABLE_CODES = ['user_not_found', 'user_disabled', 'account_inactive', 'no_such_channel'];
+function isUnrecoverable(err) {
+  return UNRECOVERABLE_CODES.some(c => err.code === c || err.message?.includes(c));
+}
 
 function startScheduler(client) {
   cron.schedule('* * * * *', async () => {
@@ -25,9 +30,7 @@ async function processAdvanceNotices(client) {
     if (new Date(reminder.due_at).getTime() - windowHours * 60 * 60 * 1000 > now) continue;
 
     const hoursLabel = formatHours(windowHours);
-    const assigneeDisplay = reminder.assignee_slack_user_id
-      ? `<@${reminder.assignee_slack_user_id}>`
-      : reminder.assignee_name;
+    const assigneeDisplay = displayAssignee(reminder);
     const bodyText = `*⏰ ${hoursLabel}後に期限のリマインドです。*\n\n*内容：* ${reminder.task}\n*期限：* ${formatDueAt(reminder.due_at)}`;
 
     try {
@@ -51,6 +54,7 @@ async function processAdvanceNotices(client) {
       console.log(`[scheduler] Advance notice (${reminder.notification_target}) sent for ${reminder.id}`);
     } catch (err) {
       console.error(`[scheduler] Advance notice failed for ${reminder.id}:`, err.message);
+      if (isUnrecoverable(err)) markAdvanceNotified(reminder.id);
     }
   }
 }
@@ -62,9 +66,7 @@ async function processDueReminders(client) {
   console.log(`[scheduler] ${reminders.length} reminder(s) due`);
 
   for (const reminder of reminders) {
-    const assigneeDisplay = reminder.assignee_slack_user_id
-      ? `<@${reminder.assignee_slack_user_id}>`
-      : reminder.assignee_name;
+    const assigneeDisplay = displayAssignee(reminder);
     const bodyText = `*リマインドです。*\n\n*内容：* ${reminder.task}\n*期限：* ${formatDueAt(reminder.due_at)}`;
 
     try {
@@ -113,31 +115,38 @@ async function postWeeklySummary(client) {
   }
 
   const lines = reminders.map((r, i) => {
-    const assignee = r.assignee_slack_user_id ? `<@${r.assignee_slack_user_id}>` : r.assignee_name;
+    const assignee = displayAssignee(r);
     const statusLabel = r.status === 'draft' ? '⏳未確認' : '✅確認済み';
     return `${i + 1}. *${r.task}*\n　担当：${assignee}　期限：${formatDueAt(r.due_at)}　${statusLabel}`;
   });
 
-  await client.chat.postMessage({
-    channel: channelId,
-    text: `📋 *週次タスクサマリー（${today}）*\n\n${lines.join('\n\n')}`,
-    blocks: [
-      {
-        type: 'header',
-        text: { type: 'plain_text', text: `📋 週次タスクサマリー（${today}）` },
-      },
-      {
-        type: 'section',
-        text: { type: 'mrkdwn', text: lines.join('\n\n') },
-      },
-      {
-        type: 'context',
-        elements: [{ type: 'mrkdwn', text: `合計 ${reminders.length} 件のペンディングタスク` }],
-      },
-    ],
-  });
-
-  console.log(`[scheduler] Weekly summary posted to ${channelId} (${reminders.length} tasks)`);
+  try {
+    await client.chat.postMessage({
+      channel: channelId,
+      text: `📋 *週次タスクサマリー（${today}）*\n\n${lines.join('\n\n')}`,
+      blocks: [
+        {
+          type: 'header',
+          text: { type: 'plain_text', text: `📋 週次タスクサマリー（${today}）` },
+        },
+        {
+          type: 'section',
+          text: { type: 'mrkdwn', text: lines.join('\n\n') },
+        },
+        {
+          type: 'context',
+          elements: [{ type: 'mrkdwn', text: `合計 ${reminders.length} 件のペンディングタスク` }],
+        },
+      ],
+    });
+    console.log(`[scheduler] Weekly summary posted to ${channelId} (${reminders.length} tasks)`);
+  } catch (err) {
+    console.error(`[scheduler] Weekly summary failed for channel ${channelId}:`, err.message);
+    if (isUnrecoverable(err)) {
+      setSetting('summary_channel_id', '');
+      console.log('[scheduler] Summary channel cleared due to unrecoverable error');
+    }
+  }
 }
 
 module.exports = { startScheduler };
