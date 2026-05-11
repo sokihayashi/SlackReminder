@@ -64,7 +64,8 @@ app.action(/^set_advance_notice_hours__\d+$/, async ({ body, ack, client }) => {
 });
 
 // Action handler: notification target toggle (DM ↔ スレッド)
-app.action('set_notification_target', async ({ body, ack, client }) => {
+// action_id format: set_notification_target__dm / set_notification_target__thread
+app.action(/^set_notification_target__/, async ({ body, ack, client }) => {
   await ack();
   const target = body.actions[0].value;
   const reminder = findByConfirmationTs(body.channel.id, body.message.ts);
@@ -72,12 +73,12 @@ app.action('set_notification_target', async ({ body, ack, client }) => {
 
   setNotificationTarget(reminder.id, target);
 
-  const dm = { type: 'button', text: { type: 'plain_text', text: '📱 DM' }, value: 'dm', action_id: 'set_notification_target' };
-  const thread = { type: 'button', text: { type: 'plain_text', text: '💬 スレッド' }, value: 'thread', action_id: 'set_notification_target' };
+  const dm = { type: 'button', text: { type: 'plain_text', text: '📱 DM' }, value: 'dm', action_id: 'set_notification_target__dm' };
+  const thread = { type: 'button', text: { type: 'plain_text', text: '💬 スレッド' }, value: 'thread', action_id: 'set_notification_target__thread' };
   if (target === 'dm') dm.style = 'primary'; else thread.style = 'primary';
 
   const updatedBlocks = body.message.blocks.map(b =>
-    b.type === 'actions' && b.elements?.some(e => e.action_id === 'set_notification_target')
+    b.type === 'actions' && b.elements?.some(e => e.action_id?.startsWith('set_notification_target__'))
       ? { type: 'actions', elements: [dm, thread] }
       : b
   );

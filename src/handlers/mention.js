@@ -273,8 +273,8 @@ async function handleShowSettings(channel, replyThreadTs, client) {
 }
 
 function notificationTargetBlock(current) {
-  const dm = { type: 'button', text: { type: 'plain_text', text: '📱 DM' }, value: 'dm', action_id: 'set_notification_target' };
-  const thread = { type: 'button', text: { type: 'plain_text', text: '💬 スレッド' }, value: 'thread', action_id: 'set_notification_target' };
+  const dm = { type: 'button', text: { type: 'plain_text', text: '📱 DM' }, value: 'dm', action_id: 'set_notification_target__dm' };
+  const thread = { type: 'button', text: { type: 'plain_text', text: '💬 スレッド' }, value: 'thread', action_id: 'set_notification_target__thread' };
   if (current === 'dm') dm.style = 'primary';
   else thread.style = 'primary';
   return { type: 'actions', elements: [dm, thread] };
