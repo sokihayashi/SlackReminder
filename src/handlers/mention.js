@@ -4,7 +4,7 @@ const {
   getAllPending, getPendingByAssignee, cancelReminder,
   getSetting, setSetting, getAllSettings,
 } = require('../db');
-const { formatDueAt, formatHours, CONFIDENCE_THRESHOLD, DEFAULT_ADVANCE_NOTICE_HOURS } = require('../utils');
+const { formatDueAt, formatHours, displayAssignee, CONFIDENCE_THRESHOLD, DEFAULT_ADVANCE_NOTICE_HOURS } = require('../utils');
 const botConfig = require('../botConfig');
 
 async function handleMention({ event, client }) {
@@ -133,7 +133,7 @@ async function handleTaskQuery(extraction, channel, replyThreadTs, client) {
   }
 
   const lines = reminders.map((r, i) => {
-    const assignee = r.assignee_slack_user_id ? `<@${r.assignee_slack_user_id}>` : r.assignee_name;
+    const assignee = displayAssignee(r);
     const statusLabel = r.status === 'draft' ? '未確認' : '確認済み';
     return `${i + 1}. *${r.task}*\n　担当：${assignee}　期限：${formatDueAt(r.due_at)}　[${statusLabel}]`;
   });
@@ -183,7 +183,7 @@ async function handleCancelReminder(extraction, text, channel, replyThreadTs, cl
   }
 
   cancelReminder(r.id);
-  const assignee = r.assignee_slack_user_id ? `<@${r.assignee_slack_user_id}>` : r.assignee_name;
+  const assignee = displayAssignee(r);
   await client.chat.postMessage({
     channel,
     thread_ts: replyThreadTs,
@@ -394,4 +394,4 @@ function extractUserId(raw) {
   return m ? m[1] : null;
 }
 
-module.exports = { handleMention };
+module.exports = { handleMention, notificationTargetBlock };

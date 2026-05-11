@@ -26,4 +26,14 @@ function formatJST(date) {
   }).format(date);
 }
 
-module.exports = { formatDueAt, formatJST, CONFIDENCE_THRESHOLD, DEFAULT_ADVANCE_NOTICE_HOURS };
+function formatHours(hours) {
+  if (hours % 24 === 0) return `${hours / 24}日`;
+  return `${hours}時間`;
+}
+
+function displayAssignee(reminder) {
+  if (reminder.assignee_slack_user_id) return `<@${reminder.assignee_slack_user_id}>`;
+  return reminder.assignee_name || '(担当者未設定)';
+}
+
+module.exports = { formatDueAt, formatJST, formatHours, displayAssignee, CONFIDENCE_THRESHOLD, DEFAULT_ADVANCE_NOTICE_HOURS };

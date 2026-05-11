@@ -108,14 +108,6 @@ function findByConfirmationTs(channelId, messageTs) {
   `).get(channelId, messageTs);
 }
 
-// Legacy alias
-function findDraftByConfirmationTs(channelId, messageTs) {
-  return db.prepare(`
-    SELECT * FROM reminders
-    WHERE source_channel_id = ? AND confirmation_message_ts = ? AND status = 'draft'
-  `).get(channelId, messageTs);
-}
-
 function approveReminder(id) {
   db.prepare(`UPDATE reminders SET status = 'pending', updated_at = ? WHERE id = ? AND status = 'draft'`)
     .run(new Date().toISOString(), id);
@@ -203,7 +195,6 @@ module.exports = {
   setNotificationTarget,
   setConfirmationTs,
   findByConfirmationTs,
-  findDraftByConfirmationTs,
   approveReminder,
   cancelReminder,
   restoreReminder,

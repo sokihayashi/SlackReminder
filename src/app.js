@@ -2,7 +2,7 @@ require('dotenv').config();
 
 const { App, LogLevel } = require('@slack/bolt');
 const botConfig = require('./botConfig');
-const { handleMention } = require('./handlers/mention');
+const { handleMention, notificationTargetBlock } = require('./handlers/mention');
 const { handleReaction } = require('./handlers/reaction');
 const { startScheduler } = require('./scheduler');
 
@@ -73,16 +73,13 @@ app.action(/^set_notification_target__/, async ({ body, ack, client }) => {
 
   setNotificationTarget(reminder.id, target);
 
-  const dm = { type: 'button', text: { type: 'plain_text', text: '📱 DM' }, value: 'dm', action_id: 'set_notification_target__dm' };
-  const thread = { type: 'button', text: { type: 'plain_text', text: '💬 スレッド' }, value: 'thread', action_id: 'set_notification_target__thread' };
-  if (target === 'dm') dm.style = 'primary'; else thread.style = 'primary';
-
   const updatedBlocks = body.message.blocks.map(b =>
     b.type === 'actions' && b.elements?.some(e => e.action_id?.startsWith('set_notification_target__'))
-      ? { type: 'actions', elements: [dm, thread] }
+      ? notificationTargetBlock(target)
       : b
   );
-  await client.chat.update({ channel: body.channel.id, ts: body.message.ts, blocks: updatedBlocks, text: body.message.text });
+  const fallbackText = body.message.text || 'リマインド候補を作成しました。';
+  await client.chat.update({ channel: body.channel.id, ts: body.message.ts, blocks: updatedBlocks, text: fallbackText });
 });
 
 // Thread reply handler: modification and restore instructions
