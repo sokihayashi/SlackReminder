@@ -14,6 +14,13 @@ async function handleMention({ event, client }) {
   console.log(`[mention] user=${user} channel=${channel}`);
 
   try {
+    // Fast-path: keyword match before calling AI
+    const bare = text.replace(/<@[^>]+>/g, '').trim();
+    if (/^(ヘルプ|help|使い方|つかいかた)\??$/i.test(bare)) {
+      await postHelp(channel, replyThreadTs, client);
+      return;
+    }
+
     const threadMessages = await fetchThreadContext(client, channel, thread_ts, ts);
     const extraction = await extractReminder(text, new Date(), threadMessages);
 
@@ -246,6 +253,57 @@ async function postAdvanceNoticeButtons(channel, replyThreadTs, client) {
         text: { type: 'mrkdwn', text: '⚙️ *事前通知タイミングを選択してください：*' },
       },
       advanceNoticeActionsBlock(),
+    ],
+  });
+}
+
+async function postHelp(channel, replyThreadTs, client) {
+  await client.chat.postMessage({
+    channel,
+    thread_ts: replyThreadTs,
+    text: 'Reminder Bot の使い方',
+    blocks: [
+      {
+        type: 'header',
+        text: { type: 'plain_text', text: '📌 Reminder Bot の使い方' },
+      },
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: '*リマインド登録*\nメンションして依頼内容を書くだけ。スレッドの途中でメンションすると会話から文脈を読み取ります。\n```@Reminder Bot @田中 台本の初稿、金曜17時まで\n@Reminder Bot @yamada 編集書き出し 来週月曜 2日前に通知して```',
+        },
+      },
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: '*リアクション操作*\n✅ → 登録確定　❌ → キャンセル\nキャンセル後に ✅ → 再登録\n確認メッセージのスレッドに返信 → 担当者・期限の修正や再登録',
+        },
+      },
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: '*タスク一覧*\n```@Reminder Bot タスク一覧\n@Reminder Bot @田中 のタスク```',
+        },
+      },
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: '*設定*\n```@Reminder Bot 設定確認\n@Reminder Bot 設定: 事前通知 2日前\n@Reminder Bot このチャンネルにタスクサマリーを設定\n@Reminder Bot サマリーを解除```',
+        },
+      },
+      {
+        type: 'context',
+        elements: [
+          {
+            type: 'mrkdwn',
+            text: '週次サマリーは毎週月曜 9:00 に送信先チャンネルへ自動投稿されます。',
+          },
+        ],
+      },
     ],
   });
 }
