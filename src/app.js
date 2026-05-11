@@ -2,7 +2,7 @@ require('dotenv').config();
 
 const { App, LogLevel } = require('@slack/bolt');
 const botConfig = require('./botConfig');
-const { handleMention, notificationTargetBlock } = require('./handlers/mention');
+const { handleMention } = require('./handlers/mention');
 const { handleReaction } = require('./handlers/reaction');
 const { startScheduler } = require('./scheduler');
 
@@ -64,8 +64,7 @@ app.action(/^set_advance_notice_hours__\d+$/, async ({ body, ack, client }) => {
 });
 
 // Action handler: notification target toggle (DM ↔ スレッド)
-// action_id format: set_notification_target__dm / set_notification_target__thread
-app.action(/^set_notification_target__/, async ({ body, ack, client }) => {
+app.action('set_notification_target', async ({ body, ack, client }) => {
   await ack();
   const target = body.actions[0].value;
   const reminder = findByConfirmationTs(body.channel.id, body.message.ts);
@@ -73,13 +72,16 @@ app.action(/^set_notification_target__/, async ({ body, ack, client }) => {
 
   setNotificationTarget(reminder.id, target);
 
+  const dm = { type: 'button', text: { type: 'plain_text', text: '📱 DM' }, value: 'dm', action_id: 'set_notification_target' };
+  const thread = { type: 'button', text: { type: 'plain_text', text: '💬 スレッド' }, value: 'thread', action_id: 'set_notification_target' };
+  if (target === 'dm') dm.style = 'primary'; else thread.style = 'primary';
+
   const updatedBlocks = body.message.blocks.map(b =>
-    b.type === 'actions' && b.elements?.some(e => e.action_id?.startsWith('set_notification_target__'))
-      ? notificationTargetBlock(target)
+    b.type === 'actions' && b.elements?.some(e => e.action_id === 'set_notification_target')
+      ? { type: 'actions', elements: [dm, thread] }
       : b
   );
-  const fallbackText = body.message.text || 'リマインド候補を作成しました。';
-  await client.chat.update({ channel: body.channel.id, ts: body.message.ts, blocks: updatedBlocks, text: fallbackText });
+  await client.chat.update({ channel: body.channel.id, ts: body.message.ts, blocks: updatedBlocks, text: body.message.text });
 });
 
 // Thread reply handler: modification and restore instructions

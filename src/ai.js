@@ -16,42 +16,12 @@ function parseJSON(raw) {
   try {
     return JSON.parse(text);
   } catch (_) {
+    // AIがJSON以外のテキストを前後に付けた場合、最初の { から最後の } を切り出す
     const start = text.indexOf('{');
-    if (start === -1) throw new Error('No JSON found in AI response');
-    let depth = 0, end = -1;
-    for (let i = start; i < text.length; i++) {
-      if (text[i] === '{') depth++;
-      else if (text[i] === '}') { depth--; if (depth === 0) { end = i; break; } }
-    }
-    if (end === -1) throw new Error('Unbalanced JSON braces in AI response');
-    return JSON.parse(text.slice(start, end + 1));
+    const end = text.lastIndexOf('}');
+    if (start !== -1 && end > start) return JSON.parse(text.slice(start, end + 1));
+    throw new Error(`AI returned non-JSON response: ${text.slice(0, 120)}`);
   }
-}
-
-const VALID_INTENTS = [
-  'create_reminder', 'query_tasks', 'cancel_reminder',
-  'update_setting', 'set_summary_channel', 'remove_summary_channel',
-  'show_settings', 'none',
-];
-
-function sanitizeExtraction(raw) {
-  return {
-    intent:               VALID_INTENTS.includes(raw.intent) ? raw.intent : 'none',
-    should_create_reminder: raw.should_create_reminder === true,
-    assignee:             raw.assignee            ?? null,
-    task:                 raw.task                ?? null,
-    due_at:               raw.due_at              ?? null,
-    confidence:           typeof raw.confidence === 'number' ? raw.confidence : 0,
-    missing_fields:       Array.isArray(raw.missing_fields) ? raw.missing_fields : [],
-    reason:               raw.reason              ?? null,
-    advance_notice_hours: Number.isFinite(raw.advance_notice_hours) ? raw.advance_notice_hours : null,
-    notification_target:  raw.notification_target === 'thread' ? 'thread' : 'dm',
-    query_assignee:       raw.query_assignee      ?? null,
-    cancel_assignee:      raw.cancel_assignee     ?? null,
-    cancel_task_hint:     raw.cancel_task_hint    ?? null,
-    setting_key:          raw.setting_key         ?? null,
-    setting_value:        raw.setting_value       ?? null,
-  };
 }
 
 /**
@@ -128,59 +98,14 @@ Respond with JSON:
     ],
   });
 
-  return sanitizeExtraction(parseJSON(response.choices[0].message.content));
-}
-
-/**
- * Use AI to identify which pending reminder the user's cancel message refers to.
- * Returns { reminder_id: string|null, reason: string|null }.
- */
-async function resolveCancelTarget(userMessage, pendingReminders) {
-  if (pendingReminders.length === 0) return { reminder_id: null, reason: 'no pending reminders' };
-
-  const list = pendingReminders.map((r, i) =>
-    `${i + 1}. id=${r.id}  担当=${r.assignee_name}  タスク=${r.task}  期限=${r.due_at}`
-  ).join('\n');
-
-  const response = await client.chat.completions.create({
-    model: MODEL,
-    max_tokens: 256,
-    response_format: { type: 'json_object' },
-    messages: [
-      {
-        role: 'system',
-        content: `以下のペンディングリマインド一覧から、ユーザーのメッセージが指しているものを特定してください。
-
-ペンディング一覧:
-${list}
-
-Respond with JSON:
-- reminder_id: string (一覧の id) | null (特定できない・複数候補)
-- reason: 判断理由`,
-      },
-      { role: 'user', content: userMessage },
-    ],
-  });
-
-  const parsed = parseJSON(response.choices[0].message.content);
-  return {
-    reminder_id: typeof parsed.reminder_id === 'string' ? parsed.reminder_id : null,
-    reason: parsed.reason ?? null,
-  };
+  return parseJSON(response.choices[0].message.content);
 }
 
 /**
  * Detect if a thread reply is a modification or restore instruction.
- * @param {string} text
- * @param {object|null} reminder - Current reminder for context
- * @param {Date} referenceDate
  */
-async function extractModification(text, reminder = null, referenceDate = new Date()) {
+async function extractModification(text, referenceDate = new Date()) {
   const jstNow = formatJST(referenceDate);
-
-  const context = reminder
-    ? `\n\n現在のリマインド: タスク="${reminder.task}", 担当="${reminder.assignee_name}", 期限="${reminder.due_at}"`
-    : '';
 
   const response = await client.chat.completions.create({
     model: MODEL,
@@ -190,7 +115,7 @@ async function extractModification(text, reminder = null, referenceDate = new Da
       {
         role: 'system',
         content: `You are a reminder modification assistant for a Japanese Slack workspace.
-Today's date and time (JST): ${jstNow}.${context}
+Today's date and time (JST): ${jstNow}.
 
 Determine if this message is a modification instruction for an existing reminder.
 
@@ -210,4 +135,4 @@ Respond with JSON:
   return parseJSON(response.choices[0].message.content);
 }
 
-module.exports = { extractReminder, extractModification, resolveCancelTarget };
+module.exports = { extractReminder, extractModification };
