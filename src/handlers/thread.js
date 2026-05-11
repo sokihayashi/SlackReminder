@@ -10,7 +10,7 @@ async function handleThreadReply({ message, client }) {
 
   let mod;
   try {
-    mod = await extractModification(text);
+    mod = await extractModification(text, reminder);
   } catch (err) {
     console.error('[thread] extractModification error:', err.message);
     return;

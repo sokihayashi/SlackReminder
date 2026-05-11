@@ -7,6 +7,8 @@ const { handleReaction } = require('./handlers/reaction');
 const { startScheduler } = require('./scheduler');
 
 const { handleThreadReply } = require('./handlers/thread');
+const { setSetting, setNotificationTarget, findByConfirmationTs } = require('./db');
+const { formatHours } = require('./utils');
 
 // Validate required environment variables at startup
 const required = ['SLACK_BOT_TOKEN', 'SLACK_SIGNING_SECRET', 'OPENROUTER_API_KEY'];
@@ -37,6 +39,50 @@ app.use(async ({ payload, next }) => {
 // Register event handlers before starting
 app.event('app_mention', handleMention);
 app.event('reaction_added', handleReaction);
+
+// Action handler: advance notice timing buttons
+// action_id format: set_advance_notice_hours__<hours>
+app.action(/^set_advance_notice_hours__\d+$/, async ({ body, ack, client }) => {
+  await ack();
+  const hours = parseInt(body.actions[0].value, 10);
+  setSetting('advance_notice_hours', String(hours));
+  const label = formatHours(hours);
+  await client.chat.update({
+    channel: body.channel.id,
+    ts: body.message.ts,
+    text: `⚙️ 事前通知タイミングを ${label}前 に更新しました。`,
+    blocks: [
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: `⚙️ *事前通知タイミングを更新しました*\n\n*${label}前* ✅`,
+        },
+      },
+    ],
+  });
+});
+
+// Action handler: notification target toggle (DM ↔ スレッド)
+app.action('set_notification_target', async ({ body, ack, client }) => {
+  await ack();
+  const target = body.actions[0].value;
+  const reminder = findByConfirmationTs(body.channel.id, body.message.ts);
+  if (!reminder) return;
+
+  setNotificationTarget(reminder.id, target);
+
+  const dm = { type: 'button', text: { type: 'plain_text', text: '📱 DM' }, value: 'dm', action_id: 'set_notification_target' };
+  const thread = { type: 'button', text: { type: 'plain_text', text: '💬 スレッド' }, value: 'thread', action_id: 'set_notification_target' };
+  if (target === 'dm') dm.style = 'primary'; else thread.style = 'primary';
+
+  const updatedBlocks = body.message.blocks.map(b =>
+    b.type === 'actions' && b.elements?.some(e => e.action_id === 'set_notification_target')
+      ? { type: 'actions', elements: [dm, thread] }
+      : b
+  );
+  await client.chat.update({ channel: body.channel.id, ts: body.message.ts, blocks: updatedBlocks, text: body.message.text });
+});
 
 // Thread reply handler: modification and restore instructions
 app.message(async ({ message, client }) => {

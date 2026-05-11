@@ -1,10 +1,10 @@
-const { extractReminder } = require('../ai');
+const { extractReminder, resolveCancelTarget } = require('../ai');
 const {
-  createReminder, setConfirmationTs,
-  getAllPending, getPendingByAssignee,
+  createReminder, setConfirmationTs, setNotificationTarget,
+  getAllPending, getPendingByAssignee, cancelReminder,
   getSetting, setSetting, getAllSettings,
 } = require('../db');
-const { formatDueAt, CONFIDENCE_THRESHOLD, DEFAULT_ADVANCE_NOTICE_HOURS } = require('../utils');
+const { formatDueAt, formatHours, CONFIDENCE_THRESHOLD, DEFAULT_ADVANCE_NOTICE_HOURS } = require('../utils');
 const botConfig = require('../botConfig');
 
 async function handleMention({ event, client }) {
@@ -14,13 +14,23 @@ async function handleMention({ event, client }) {
   console.log(`[mention] user=${user} channel=${channel}`);
 
   try {
+    // Fast-path: keyword match before calling AI
+    const bare = text.replace(/<@[^>]+>/g, '').trim();
+    if (/^(ヘルプ|help|使い方|つかいかた)\??$/i.test(bare)) {
+      await postHelp(channel, replyThreadTs, client);
+      return;
+    }
+
     const threadMessages = await fetchThreadContext(client, channel, thread_ts, ts);
     const extraction = await extractReminder(text, new Date(), threadMessages);
 
     switch (extraction.intent) {
-      case 'query_tasks':    return handleTaskQuery(extraction, channel, replyThreadTs, client);
-      case 'update_setting': return handleUpdateSetting(extraction, channel, replyThreadTs, client);
-      case 'show_settings':  return handleShowSettings(channel, replyThreadTs, client);
+      case 'query_tasks':           return handleTaskQuery(extraction, channel, replyThreadTs, client);
+      case 'cancel_reminder':       return handleCancelReminder(extraction, text, channel, replyThreadTs, client);
+      case 'update_setting':        return handleUpdateSetting(extraction, channel, replyThreadTs, client);
+      case 'set_summary_channel':   return handleSetSummaryChannel(channel, replyThreadTs, client);
+      case 'remove_summary_channel':return handleRemoveSummaryChannel(channel, replyThreadTs, client);
+      case 'show_settings':         return handleShowSettings(channel, replyThreadTs, client);
     }
 
     if (!extraction.should_create_reminder) {
@@ -46,6 +56,8 @@ async function handleMention({ event, client }) {
 
     const { assigneeSlackUserId, assigneeName } = resolveAssignee(extraction.assignee);
 
+    const notifTarget = extraction.notification_target === 'thread' ? 'thread' : 'dm';
+
     const reminderId = createReminder({
       task: extraction.task,
       assigneeName,
@@ -57,6 +69,7 @@ async function handleMention({ event, client }) {
       createdBy: user,
       confidence: extraction.confidence,
       advanceNoticeHours: extraction.advance_notice_hours ?? null,
+      notificationTarget: notifTarget,
     });
 
     const dueDisplay = formatDueAt(extraction.due_at);
@@ -77,12 +90,13 @@ async function handleMention({ event, client }) {
             text: `*リマインド候補を作成しました。*\n\n*担当：* ${assigneeDisplay}\n*期限：* ${dueDisplay}\n*内容：* ${extraction.task}`,
           },
         },
+        notificationTargetBlock(notifTarget),
         {
           type: 'context',
           elements: [
             {
               type: 'mrkdwn',
-              text: `確信度：${Math.round(extraction.confidence * 100)}%　|　事前通知：${noticeLabel}前　|　✅ 登録　❌ キャンセル　※スレッドに返信で修正可`,
+              text: `事前通知：${noticeLabel}前　|　✅ 登録　❌ キャンセル　※スレッドに返信で修正可`,
             },
           ],
         },
@@ -131,25 +145,67 @@ async function handleTaskQuery(extraction, channel, replyThreadTs, client) {
   });
 }
 
+async function handleCancelReminder(extraction, text, channel, replyThreadTs, client) {
+  const pending = getAllPending();
+
+  if (pending.length === 0) {
+    await client.chat.postMessage({
+      channel,
+      thread_ts: replyThreadTs,
+      text: 'キャンセル対象のペンディングリマインドが見つかりませんでした。',
+    });
+    return;
+  }
+
+  const { reminder_id } = await resolveCancelTarget(text, pending);
+
+  if (!reminder_id) {
+    const lines = pending.map((r, i) => {
+      const assignee = r.assignee_slack_user_id ? `<@${r.assignee_slack_user_id}>` : r.assignee_name;
+      return `${i + 1}. *${r.task}*　担当：${assignee}　期限：${formatDueAt(r.due_at)}`;
+    });
+    await client.chat.postMessage({
+      channel,
+      thread_ts: replyThreadTs,
+      text: `キャンセル対象を特定できませんでした。確認メッセージの ❌ でキャンセルするか、もう少し詳しく教えてください。\n\n${lines.join('\n')}`,
+    });
+    return;
+  }
+
+  const r = pending.find(p => p.id === reminder_id);
+  if (!r) {
+    await client.chat.postMessage({
+      channel,
+      thread_ts: replyThreadTs,
+      text: 'キャンセル対象のペンディングリマインドが見つかりませんでした。',
+    });
+    return;
+  }
+
+  cancelReminder(r.id);
+  const assignee = r.assignee_slack_user_id ? `<@${r.assignee_slack_user_id}>` : r.assignee_name;
+  await client.chat.postMessage({
+    channel,
+    thread_ts: replyThreadTs,
+    text: `❌ リマインドをキャンセルしました。\n*内容：* ${r.task}　*担当：* ${assignee}　*期限：* ${formatDueAt(r.due_at)}`,
+  });
+}
+
 async function handleUpdateSetting(extraction, channel, replyThreadTs, client) {
   const { setting_key: key, setting_value: value } = extraction;
 
   if (key === 'advance_notice_hours') {
     const hours = parseInt(value, 10);
-    if (!Number.isFinite(hours) || hours < 0) {
+    if (Number.isFinite(hours) && hours >= 0) {
+      setSetting('advance_notice_hours', String(hours));
       await client.chat.postMessage({
         channel,
         thread_ts: replyThreadTs,
-        text: '設定値が正しくありません。例：`@Reminder Bot 設定: 事前通知 2日前`',
+        text: `⚙️ 事前通知タイミングを *${formatHours(hours)}前* に設定しました。`,
       });
-      return;
+    } else {
+      await postAdvanceNoticeButtons(channel, replyThreadTs, client);
     }
-    setSetting('advance_notice_hours', String(hours));
-    await client.chat.postMessage({
-      channel,
-      thread_ts: replyThreadTs,
-      text: `⚙️ 設定を更新しました。\n*事前通知タイミング：* ${formatHours(hours)}前\n\n※ 個別のリマインドで「X日前に通知」と指定するとそちらが優先されます。`,
-    });
     return;
   }
 
@@ -160,12 +216,152 @@ async function handleUpdateSetting(extraction, channel, replyThreadTs, client) {
   });
 }
 
-async function handleShowSettings(channel, replyThreadTs, client) {
-  const advanceHours = parseInt(getSetting('advance_notice_hours', String(DEFAULT_ADVANCE_NOTICE_HOURS)), 10);
+async function handleSetSummaryChannel(channel, replyThreadTs, client) {
+  setSetting('summary_channel_id', channel);
   await client.chat.postMessage({
     channel,
     thread_ts: replyThreadTs,
-    text: `⚙️ *現在の設定*\n\n*事前通知タイミング：* ${formatHours(advanceHours)}前（デフォルト）`,
+    text: `📋 このチャンネルを週次タスクサマリーの送信先に設定しました。\n毎週月曜 9:00 にペンディングタスクをまとめて投稿します。`,
+  });
+}
+
+async function handleRemoveSummaryChannel(channel, replyThreadTs, client) {
+  const current = getSetting('summary_channel_id');
+  if (current !== channel) {
+    await client.chat.postMessage({
+      channel,
+      thread_ts: replyThreadTs,
+      text: 'このチャンネルはサマリー送信先として設定されていません。',
+    });
+    return;
+  }
+  setSetting('summary_channel_id', '');
+  await client.chat.postMessage({
+    channel,
+    thread_ts: replyThreadTs,
+    text: '📋 週次タスクサマリーの設定を解除しました。',
+  });
+}
+
+async function handleShowSettings(channel, replyThreadTs, client) {
+  const advanceHours = parseInt(getSetting('advance_notice_hours', String(DEFAULT_ADVANCE_NOTICE_HOURS)), 10);
+  const summaryChannelId = getSetting('summary_channel_id', '');
+  const summaryLine = summaryChannelId
+    ? `*週次サマリー：* <#${summaryChannelId}>（毎週月曜 9:00）`
+    : `*週次サマリー：* 未設定`;
+
+  await client.chat.postMessage({
+    channel,
+    thread_ts: replyThreadTs,
+    text: `⚙️ 現在の設定`,
+    blocks: [
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: `⚙️ *現在の設定*\n\n*事前通知タイミング：* ${formatHours(advanceHours)}前\n${summaryLine}`,
+        },
+      },
+      { type: 'divider' },
+      {
+        type: 'section',
+        text: { type: 'mrkdwn', text: '*事前通知タイミングを変更：*' },
+      },
+      advanceNoticeActionsBlock(),
+    ],
+  });
+}
+
+function notificationTargetBlock(current) {
+  const dm = { type: 'button', text: { type: 'plain_text', text: '📱 DM' }, value: 'dm', action_id: 'set_notification_target' };
+  const thread = { type: 'button', text: { type: 'plain_text', text: '💬 スレッド' }, value: 'thread', action_id: 'set_notification_target' };
+  if (current === 'dm') dm.style = 'primary';
+  else thread.style = 'primary';
+  return { type: 'actions', elements: [dm, thread] };
+}
+
+function advanceNoticeActionsBlock() {
+  const options = [
+    { label: '12時間前', value: '12' },
+    { label: '1日前',   value: '24' },
+    { label: '2日前',   value: '48' },
+    { label: '3日前',   value: '72' },
+    { label: '1週間前', value: '168' },
+  ];
+  return {
+    type: 'actions',
+    elements: options.map(o => ({
+      type: 'button',
+      text: { type: 'plain_text', text: o.label },
+      value: o.value,
+      action_id: `set_advance_notice_hours__${o.value}`,
+    })),
+  };
+}
+
+async function postAdvanceNoticeButtons(channel, replyThreadTs, client) {
+  await client.chat.postMessage({
+    channel,
+    thread_ts: replyThreadTs,
+    text: '事前通知タイミングを選択してください',
+    blocks: [
+      {
+        type: 'section',
+        text: { type: 'mrkdwn', text: '⚙️ *事前通知タイミングを選択してください：*' },
+      },
+      advanceNoticeActionsBlock(),
+    ],
+  });
+}
+
+async function postHelp(channel, replyThreadTs, client) {
+  await client.chat.postMessage({
+    channel,
+    thread_ts: replyThreadTs,
+    text: 'Reminder Bot の使い方',
+    blocks: [
+      {
+        type: 'header',
+        text: { type: 'plain_text', text: '📌 Reminder Bot の使い方' },
+      },
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: '*リマインド登録*\nメンションして依頼内容を書くだけ。スレッドの途中でメンションすると会話から文脈を読み取ります。\n```@Reminder Bot @田中 台本の初稿、金曜17時まで\n@Reminder Bot @yamada 編集書き出し 来週月曜 2日前に通知して```',
+        },
+      },
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: '*リアクション操作*\n✅ → 登録確定　❌ → キャンセル\nキャンセル後に ✅ → 再登録\n確認メッセージのスレッドに返信 → 担当者・期限の修正や再登録',
+        },
+      },
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: '*タスク一覧*\n```@Reminder Bot タスク一覧\n@Reminder Bot @田中 のタスク```',
+        },
+      },
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: '*設定*\n```@Reminder Bot 設定確認\n@Reminder Bot 設定: 事前通知 2日前\n@Reminder Bot このチャンネルにタスクサマリーを設定\n@Reminder Bot サマリーを解除```',
+        },
+      },
+      {
+        type: 'context',
+        elements: [
+          {
+            type: 'mrkdwn',
+            text: '週次サマリーは毎週月曜 9:00 に送信先チャンネルへ自動投稿されます。',
+          },
+        ],
+      },
+    ],
   });
 }
 
@@ -176,9 +372,9 @@ async function fetchThreadContext(client, channel, thread_ts, currentTs) {
   try {
     const result = await client.conversations.replies({ channel, ts: thread_ts, limit: 10 });
     return (result.messages || [])
-      .filter(m => m.user && m.user !== botConfig.botUserId && m.ts !== currentTs)
+      .filter(m => m.user && m.user !== botConfig.botUserId && m.ts !== currentTs && m.text)
       .slice(-5)
-      .map(m => ({ user: m.user, text: m.text }));
+      .map(m => ({ user: m.user, text: m.text.slice(0, 300) }));
   } catch (e) {
     console.error('[mention] Failed to fetch thread context:', e.message);
     return [];
@@ -196,11 +392,6 @@ function extractUserId(raw) {
   if (!raw) return null;
   const m = raw.match(/^<@(U[A-Z0-9]+)>$/) || raw.match(/^(U[A-Z0-9]{6,})$/);
   return m ? m[1] : null;
-}
-
-function formatHours(hours) {
-  if (hours % 24 === 0) return `${hours / 24}日`;
-  return `${hours}時間`;
 }
 
 module.exports = { handleMention };

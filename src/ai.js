@@ -12,8 +12,46 @@ const client = new OpenAI({
 const MODEL = process.env.OPENROUTER_MODEL || 'anthropic/claude-haiku-4-5';
 
 function parseJSON(raw) {
-  const cleaned = raw.replace(/^```(?:json)?\s*/m, '').replace(/\s*```\s*$/m, '').trim();
-  return JSON.parse(cleaned);
+  const text = raw.replace(/^```(?:json)?\s*/m, '').replace(/\s*```\s*$/m, '').trim();
+  try {
+    return JSON.parse(text);
+  } catch (_) {
+    const start = text.indexOf('{');
+    if (start === -1) throw new Error('No JSON found in AI response');
+    let depth = 0, end = -1;
+    for (let i = start; i < text.length; i++) {
+      if (text[i] === '{') depth++;
+      else if (text[i] === '}') { depth--; if (depth === 0) { end = i; break; } }
+    }
+    if (end === -1) throw new Error('Unbalanced JSON braces in AI response');
+    return JSON.parse(text.slice(start, end + 1));
+  }
+}
+
+const VALID_INTENTS = [
+  'create_reminder', 'query_tasks', 'cancel_reminder',
+  'update_setting', 'set_summary_channel', 'remove_summary_channel',
+  'show_settings', 'none',
+];
+
+function sanitizeExtraction(raw) {
+  return {
+    intent:               VALID_INTENTS.includes(raw.intent) ? raw.intent : 'none',
+    should_create_reminder: raw.should_create_reminder === true,
+    assignee:             raw.assignee            ?? null,
+    task:                 raw.task                ?? null,
+    due_at:               raw.due_at              ?? null,
+    confidence:           typeof raw.confidence === 'number' ? raw.confidence : 0,
+    missing_fields:       Array.isArray(raw.missing_fields) ? raw.missing_fields : [],
+    reason:               raw.reason              ?? null,
+    advance_notice_hours: Number.isFinite(raw.advance_notice_hours) ? raw.advance_notice_hours : null,
+    notification_target:  raw.notification_target === 'thread' ? 'thread' : 'dm',
+    query_assignee:       raw.query_assignee      ?? null,
+    cancel_assignee:      raw.cancel_assignee     ?? null,
+    cancel_task_hint:     raw.cancel_task_hint    ?? null,
+    setting_key:          raw.setting_key         ?? null,
+    setting_value:        raw.setting_value       ?? null,
+  };
 }
 
 /**
@@ -50,17 +88,29 @@ Intent options:
   → Ambiguous date → confidence < 0.6, add "due_at" to missing_fields
   → No clear assignee → add "assignee" to missing_fields
   → "X日前に通知" or "X時間前に通知" in the message → set advance_notice_hours accordingly
+  → "このスレッドに通知" / "チャンネルで通知" / "DMじゃなく" / "ここに通知" → notification_target: "thread"
+  → default notification_target: "dm"
   → due_at must be ISO 8601 with JST offset, e.g. "2026-05-20T10:00:00+09:00"
 - "query_tasks": user wants to list existing reminders (e.g. タスク一覧, 誰が何を, リスト)
   → set query_assignee to <@U...> if asking for a specific person, else null
 - "update_setting": user wants to change a bot setting (e.g. 設定: 事前通知 2日前, デフォルト通知を3日前に)
   → setting_key: "advance_notice_hours"
   → setting_value: integer string (e.g. "48" for 2日前)
+- "cancel_reminder": user wants to cancel an existing pending reminder
+  (e.g. はやしへのリマインド解除して, @田中のタスクをキャンセル, 編集のリマインド取り消し)
+  → set cancel_assignee to <@U...> or display name if a person is specified, else null
+  → set cancel_task_hint to a keyword from the task description if specified, else null
+- "set_summary_channel": user wants this channel to receive the weekly task summary
+  (e.g. このチャンネルにタスクサマリーを設定, ここに週次サマリーを送って, このチャンネルで月曜まとめ)
+- "remove_summary_channel": user wants to stop summary in this channel
+  (e.g. サマリーを解除, 週次まとめを止めて)
 - "show_settings": user wants to see current settings (e.g. 設定確認, 現在の設定)
 - "none": casual conversation or unclear
 
 Respond with JSON:
-- intent: "create_reminder" | "query_tasks" | "update_setting" | "show_settings" | "none"
+- intent: "create_reminder" | "query_tasks" | "cancel_reminder" | "update_setting" | "set_summary_channel" | "remove_summary_channel" | "show_settings" | "none"
+- cancel_assignee: string or null
+- cancel_task_hint: string or null
 - query_assignee: string or null
 - setting_key: string or null
 - setting_value: string or null
@@ -69,6 +119,7 @@ Respond with JSON:
 - task: string or null
 - due_at: string or null
 - advance_notice_hours: integer or null (per-reminder override; null = use global default)
+- notification_target: "dm" | "thread"
 - confidence: number 0.0-1.0
 - missing_fields: array of strings
 - reason: string or null`,
@@ -77,14 +128,59 @@ Respond with JSON:
     ],
   });
 
-  return parseJSON(response.choices[0].message.content);
+  return sanitizeExtraction(parseJSON(response.choices[0].message.content));
+}
+
+/**
+ * Use AI to identify which pending reminder the user's cancel message refers to.
+ * Returns { reminder_id: string|null, reason: string|null }.
+ */
+async function resolveCancelTarget(userMessage, pendingReminders) {
+  if (pendingReminders.length === 0) return { reminder_id: null, reason: 'no pending reminders' };
+
+  const list = pendingReminders.map((r, i) =>
+    `${i + 1}. id=${r.id}  担当=${r.assignee_name}  タスク=${r.task}  期限=${r.due_at}`
+  ).join('\n');
+
+  const response = await client.chat.completions.create({
+    model: MODEL,
+    max_tokens: 256,
+    response_format: { type: 'json_object' },
+    messages: [
+      {
+        role: 'system',
+        content: `以下のペンディングリマインド一覧から、ユーザーのメッセージが指しているものを特定してください。
+
+ペンディング一覧:
+${list}
+
+Respond with JSON:
+- reminder_id: string (一覧の id) | null (特定できない・複数候補)
+- reason: 判断理由`,
+      },
+      { role: 'user', content: userMessage },
+    ],
+  });
+
+  const parsed = parseJSON(response.choices[0].message.content);
+  return {
+    reminder_id: typeof parsed.reminder_id === 'string' ? parsed.reminder_id : null,
+    reason: parsed.reason ?? null,
+  };
 }
 
 /**
  * Detect if a thread reply is a modification or restore instruction.
+ * @param {string} text
+ * @param {object|null} reminder - Current reminder for context
+ * @param {Date} referenceDate
  */
-async function extractModification(text, referenceDate = new Date()) {
+async function extractModification(text, reminder = null, referenceDate = new Date()) {
   const jstNow = formatJST(referenceDate);
+
+  const context = reminder
+    ? `\n\n現在のリマインド: タスク="${reminder.task}", 担当="${reminder.assignee_name}", 期限="${reminder.due_at}"`
+    : '';
 
   const response = await client.chat.completions.create({
     model: MODEL,
@@ -94,7 +190,7 @@ async function extractModification(text, referenceDate = new Date()) {
       {
         role: 'system',
         content: `You are a reminder modification assistant for a Japanese Slack workspace.
-Today's date and time (JST): ${jstNow}.
+Today's date and time (JST): ${jstNow}.${context}
 
 Determine if this message is a modification instruction for an existing reminder.
 
@@ -114,4 +210,4 @@ Respond with JSON:
   return parseJSON(response.choices[0].message.content);
 }
 
-module.exports = { extractReminder, extractModification };
+module.exports = { extractReminder, extractModification, resolveCancelTarget };
