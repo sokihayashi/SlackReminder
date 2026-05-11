@@ -12,8 +12,16 @@ const client = new OpenAI({
 const MODEL = process.env.OPENROUTER_MODEL || 'anthropic/claude-haiku-4-5';
 
 function parseJSON(raw) {
-  const cleaned = raw.replace(/^```(?:json)?\s*/m, '').replace(/\s*```\s*$/m, '').trim();
-  return JSON.parse(cleaned);
+  const text = raw.replace(/^```(?:json)?\s*/m, '').replace(/\s*```\s*$/m, '').trim();
+  try {
+    return JSON.parse(text);
+  } catch (_) {
+    // AIがJSON以外のテキストを前後に付けた場合、最初の { から最後の } を切り出す
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
+    if (start !== -1 && end > start) return JSON.parse(text.slice(start, end + 1));
+    throw new Error(`AI returned non-JSON response: ${text.slice(0, 120)}`);
+  }
 }
 
 /**
@@ -58,6 +66,10 @@ Intent options:
 - "update_setting": user wants to change a bot setting (e.g. 設定: 事前通知 2日前, デフォルト通知を3日前に)
   → setting_key: "advance_notice_hours"
   → setting_value: integer string (e.g. "48" for 2日前)
+- "cancel_reminder": user wants to cancel an existing pending reminder
+  (e.g. はやしへのリマインド解除して, @田中のタスクをキャンセル, 編集のリマインド取り消し)
+  → set cancel_assignee to <@U...> or display name if a person is specified, else null
+  → set cancel_task_hint to a keyword from the task description if specified, else null
 - "set_summary_channel": user wants this channel to receive the weekly task summary
   (e.g. このチャンネルにタスクサマリーを設定, ここに週次サマリーを送って, このチャンネルで月曜まとめ)
 - "remove_summary_channel": user wants to stop summary in this channel
@@ -66,7 +78,9 @@ Intent options:
 - "none": casual conversation or unclear
 
 Respond with JSON:
-- intent: "create_reminder" | "query_tasks" | "update_setting" | "set_summary_channel" | "remove_summary_channel" | "show_settings" | "none"
+- intent: "create_reminder" | "query_tasks" | "cancel_reminder" | "update_setting" | "set_summary_channel" | "remove_summary_channel" | "show_settings" | "none"
+- cancel_assignee: string or null
+- cancel_task_hint: string or null
 - query_assignee: string or null
 - setting_key: string or null
 - setting_value: string or null
