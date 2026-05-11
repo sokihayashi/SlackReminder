@@ -26,6 +26,12 @@ const app = new App({
   logLevel: LogLevel.INFO,
 });
 
+// Debug: log all incoming events
+app.use(async ({ payload, next }) => {
+  console.log(`[debug] incoming event type=${payload?.type} subtype=${payload?.subtype}`);
+  await next();
+});
+
 // Register event handlers before starting
 app.event('app_mention', handleMention);
 app.event('reaction_added', handleReaction);
