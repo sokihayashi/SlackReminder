@@ -8,7 +8,7 @@ const client = new OpenAI({
   },
 });
 
-const MODEL = process.env.OPENROUTER_MODEL || 'anthropic/claude-3-haiku';
+const MODEL = process.env.OPENROUTER_MODEL || 'anthropic/claude-haiku-4-5';
 
 /**
  * Extract reminder fields from a Slack message text using OpenRouter.
