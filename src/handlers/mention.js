@@ -26,7 +26,7 @@ async function handleMention({ event, client }) {
 
     switch (extraction.intent) {
       case 'query_tasks':           return handleTaskQuery(extraction, channel, replyThreadTs, client);
-      case 'cancel_reminder':       return handleCancelReminder(text, channel, replyThreadTs, client);
+      case 'cancel_reminder':       return handleCancelReminder(text, extraction, channel, replyThreadTs, client);
       case 'update_setting':        return handleUpdateSetting(extraction, channel, replyThreadTs, client);
       case 'set_summary_channel':   return handleSetSummaryChannel(channel, replyThreadTs, client);
       case 'remove_summary_channel':return handleRemoveSummaryChannel(channel, replyThreadTs, client);
@@ -145,7 +145,7 @@ async function handleTaskQuery(extraction, channel, replyThreadTs, client) {
   });
 }
 
-async function handleCancelReminder(text, channel, replyThreadTs, client) {
+async function handleCancelReminder(text, extraction, channel, replyThreadTs, client) {
   const pending = getAllPending();
 
   if (pending.length === 0) {
@@ -172,6 +172,27 @@ async function handleCancelReminder(text, channel, replyThreadTs, client) {
   const { reminder_id } = await resolveCancelTarget(text, pending);
 
   if (!reminder_id) {
+    // Fallback: assignee-based bulk cancel when AI extracted a cancel_assignee
+    const cancelAssignee = extraction.cancel_assignee;
+    if (cancelAssignee) {
+      const assigneeId = extractUserId(cancelAssignee);
+      const matched = pending.filter(r =>
+        assigneeId
+          ? r.assignee_slack_user_id === assigneeId
+          : r.assignee_name?.includes(cancelAssignee)
+      );
+      if (matched.length > 0) {
+        for (const r of matched) cancelReminder(r.id);
+        const label = assigneeId ? `<@${assigneeId}>` : cancelAssignee;
+        await client.chat.postMessage({
+          channel,
+          thread_ts: replyThreadTs,
+          text: `❌ ${label} のリマインドを ${matched.length}件キャンセルしました。`,
+        });
+        return;
+      }
+    }
+
     const lines = pending.map((r, i) => {
       const assignee = displayAssignee(r);
       return `${i + 1}. *${r.task}*　担当：${assignee}　期限：${formatDueAt(r.due_at)}`;
