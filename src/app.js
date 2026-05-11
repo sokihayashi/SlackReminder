@@ -6,8 +6,10 @@ const { handleMention } = require('./handlers/mention');
 const { handleReaction } = require('./handlers/reaction');
 const { startScheduler } = require('./scheduler');
 
+const { handleThreadReply } = require('./handlers/thread');
+
 // Validate required environment variables at startup
-const required = ['SLACK_BOT_TOKEN', 'SLACK_SIGNING_SECRET', 'ANTHROPIC_API_KEY'];
+const required = ['SLACK_BOT_TOKEN', 'SLACK_SIGNING_SECRET', 'OPENROUTER_API_KEY'];
 for (const key of required) {
   if (!process.env[key]) {
     console.error(`Missing required environment variable: ${key}`);
@@ -26,9 +28,25 @@ const app = new App({
   logLevel: LogLevel.INFO,
 });
 
+// Debug: log all incoming events
+app.use(async ({ payload, next }) => {
+  console.log(`[debug] incoming event type=${payload?.type} subtype=${payload?.subtype}`);
+  await next();
+});
+
 // Register event handlers before starting
 app.event('app_mention', handleMention);
 app.event('reaction_added', handleReaction);
+
+// Thread reply handler: modification and restore instructions
+app.message(async ({ message, client }) => {
+  if (!message.thread_ts) return;
+  if (!message.user || message.subtype === 'bot_message') return;
+  if (message.user === botConfig.botUserId) return;
+  // Skip messages that mention the bot (handled by app_mention)
+  if (message.text && message.text.includes(`<@${botConfig.botUserId}>`)) return;
+  await handleThreadReply({ message, client });
+});
 
 (async () => {
   await app.start();

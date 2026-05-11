@@ -1,39 +1,48 @@
-const { findDraftByConfirmationTs, approveReminder, cancelReminder } = require('../db');
+const { findByConfirmationTs, approveReminder, cancelReminder, restoreReminder } = require('../db');
 const { formatDueAt } = require('../utils');
 const botConfig = require('../botConfig');
 
 async function handleReaction({ event, client }) {
   const { reaction, item, user } = event;
 
-  // Ignore the bot's own reactions (added as affordance)
   if (user === botConfig.botUserId) return;
-
-  // Only care about message reactions
   if (item.type !== 'message') return;
-
-  // Only handle ✅ and ❌
   if (!['white_check_mark', 'x'].includes(reaction)) return;
 
-  const reminder = findDraftByConfirmationTs(item.channel, item.ts);
+  const reminder = findByConfirmationTs(item.channel, item.ts);
   if (!reminder) return;
 
+  const assigneeDisplay = reminder.assignee_slack_user_id
+    ? `<@${reminder.assignee_slack_user_id}>`
+    : reminder.assignee_name;
+
   if (reaction === 'white_check_mark') {
-    approveReminder(reminder.id);
-    const assigneeDisplay = reminder.assignee_slack_user_id
-      ? `<@${reminder.assignee_slack_user_id}>`
-      : reminder.assignee_name;
-    await client.chat.postMessage({
-      channel: item.channel,
-      thread_ts: reminder.source_thread_ts,
-      text: `✅ リマインドを登録しました。\n${formatDueAt(reminder.due_at)} に ${assigneeDisplay} へ通知します。`,
-    });
+    if (reminder.status === 'draft') {
+      approveReminder(reminder.id);
+      await client.chat.postMessage({
+        channel: item.channel,
+        thread_ts: reminder.source_thread_ts,
+        text: `✅ リマインドを登録しました。\n${formatDueAt(reminder.due_at)} に ${assigneeDisplay} へ通知します。`,
+      });
+    } else if (reminder.status === 'cancelled') {
+      // Re-approve a previously cancelled reminder
+      restoreReminder(reminder.id);
+      approveReminder(reminder.id);
+      await client.chat.postMessage({
+        channel: item.channel,
+        thread_ts: reminder.source_thread_ts,
+        text: `✅ リマインドを再登録しました。\n${formatDueAt(reminder.due_at)} に ${assigneeDisplay} へ通知します。`,
+      });
+    }
   } else if (reaction === 'x') {
-    cancelReminder(reminder.id);
-    await client.chat.postMessage({
-      channel: item.channel,
-      thread_ts: reminder.source_thread_ts,
-      text: '❌ リマインドを取り消しました。',
-    });
+    if (['draft', 'pending'].includes(reminder.status)) {
+      cancelReminder(reminder.id);
+      await client.chat.postMessage({
+        channel: item.channel,
+        thread_ts: reminder.source_thread_ts,
+        text: '❌ リマインドを取り消しました。間違えた場合は ✅ で再登録、またはスレッドに「再登録」と返信できます。',
+      });
+    }
   }
 }
 

@@ -1,88 +1,117 @@
-const Anthropic = require('@anthropic-ai/sdk');
+const OpenAI = require('openai');
+const { formatJST } = require('./utils');
 
-const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-
-// JSON schema for structured extraction — ensures valid JSON every call
-const extractionSchema = {
-  type: 'object',
-  properties: {
-    should_create_reminder: {
-      type: 'boolean',
-      description: 'Whether this message is requesting a task reminder',
-    },
-    assignee: {
-      anyOf: [{ type: 'string' }, { type: 'null' }],
-      description: 'Slack mention like "<@U123456>" if present, or person\'s name as written',
-    },
-    task: {
-      anyOf: [{ type: 'string' }, { type: 'null' }],
-      description: 'Concise description of what needs to be done',
-    },
-    due_at: {
-      anyOf: [{ type: 'string' }, { type: 'null' }],
-      description: 'ISO 8601 datetime with JST offset, e.g. "2026-05-20T10:00:00+09:00"',
-    },
-    confidence: {
-      type: 'number',
-      description: '0.0–1.0 confidence in the extraction',
-    },
-    missing_fields: {
-      type: 'array',
-      items: { type: 'string' },
-      description: 'Fields that are unclear or missing, e.g. ["due_at", "assignee"]',
-    },
-    reason: {
-      anyOf: [{ type: 'string' }, { type: 'null' }],
-      description: 'Brief explanation of interpretation',
-    },
+const client = new OpenAI({
+  apiKey: process.env.OPENROUTER_API_KEY,
+  baseURL: 'https://openrouter.ai/api/v1',
+  defaultHeaders: {
+    'HTTP-Referer': 'https://github.com/sokihayashi/SlackReminder',
   },
-  required: ['should_create_reminder', 'confidence', 'missing_fields'],
-  additionalProperties: false,
-};
+});
 
-/**
- * Extract reminder fields from a Slack message text using Claude.
- * @param {string} text - Raw Slack message text (may include <@U...> mentions)
- * @param {Date} referenceDate - Current date used to resolve relative expressions
- * @returns {Promise<object>} Extracted reminder fields
- */
-async function extractReminder(text, referenceDate = new Date()) {
-  const jstNow = new Intl.DateTimeFormat('ja-JP', {
-    timeZone: 'Asia/Tokyo',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    weekday: 'long',
-  }).format(referenceDate);
+const MODEL = process.env.OPENROUTER_MODEL || 'anthropic/claude-haiku-4-5';
 
-  const response = await client.messages.create({
-    model: 'claude-haiku-4-5',
-    max_tokens: 1024,
-    output_config: {
-      format: {
-        type: 'json_schema',
-        name: 'reminder_extraction',
-        schema: extractionSchema,
-      },
-    },
-    system: `You are a reminder extraction assistant for a Japanese Slack workspace.
-Extract reminder information from Slack messages. Today's date and time (JST): ${jstNow}.
-
-Rules:
-- Interpret relative dates (明日, 来週, 今週中, etc.) based on the JST current time above
-- If a date is given but no time, default to 10:00 JST
-- If "前日にリマインド" or similar, subtract one day from the deadline for due_at
-- If the date is ambiguous (e.g. "そのうち", "近日中"), set confidence below 0.6 and add "due_at" to missing_fields
-- If no person is clearly identified as the task owner, add "assignee" to missing_fields
-- Set should_create_reminder to false for casual conversation that does not involve a task
-- due_at must be ISO 8601 with JST offset, e.g. "2026-05-20T10:00:00+09:00"`,
-    messages: [{ role: 'user', content: text }],
-  });
-
-  const textBlock = response.content.find((b) => b.type === 'text');
-  return JSON.parse(textBlock.text);
+function parseJSON(raw) {
+  const cleaned = raw.replace(/^```(?:json)?\s*/m, '').replace(/\s*```\s*$/m, '').trim();
+  return JSON.parse(cleaned);
 }
 
-module.exports = { extractReminder };
+/**
+ * Extract reminder intent and fields from a Slack message.
+ * @param {string} text
+ * @param {Date} referenceDate
+ * @param {{user: string, text: string}[]} threadMessages - Prior thread messages for context
+ */
+async function extractReminder(text, referenceDate = new Date(), threadMessages = []) {
+  const jstNow = formatJST(referenceDate);
+
+  const threadSection = threadMessages.length > 0
+    ? `\n\nThread context (recent messages — use to infer assignee or task if not stated):\n${threadMessages.map(m => `  [${m.user}]: ${m.text}`).join('\n')}`
+    : '';
+
+  const response = await client.chat.completions.create({
+    model: MODEL,
+    max_tokens: 1024,
+    response_format: { type: 'json_object' },
+    messages: [
+      {
+        role: 'system',
+        content: `You are a reminder extraction assistant for a Japanese Slack workspace.
+Today's date and time (JST): ${jstNow}.${threadSection}
+
+Determine the user's intent, then extract fields accordingly.
+
+Intent options:
+- "create_reminder": user wants to set a new reminder
+  → The first <@UXXXXXXX> in the message is the bot — ignore it for assignee
+  → Other <@UXXXXXXX> mentions are the assignee; also infer from thread context
+  → Interpret relative dates (明日, 来週, 今週中) from JST time above; default time 10:00 JST
+  → "前日にリマインド" → subtract one day from due_at
+  → Ambiguous date → confidence < 0.6, add "due_at" to missing_fields
+  → No clear assignee → add "assignee" to missing_fields
+  → "X日前に通知" or "X時間前に通知" in the message → set advance_notice_hours accordingly
+  → due_at must be ISO 8601 with JST offset, e.g. "2026-05-20T10:00:00+09:00"
+- "query_tasks": user wants to list existing reminders (e.g. タスク一覧, 誰が何を, リスト)
+  → set query_assignee to <@U...> if asking for a specific person, else null
+- "update_setting": user wants to change a bot setting (e.g. 設定: 事前通知 2日前, デフォルト通知を3日前に)
+  → setting_key: "advance_notice_hours"
+  → setting_value: integer string (e.g. "48" for 2日前)
+- "show_settings": user wants to see current settings (e.g. 設定確認, 現在の設定)
+- "none": casual conversation or unclear
+
+Respond with JSON:
+- intent: "create_reminder" | "query_tasks" | "update_setting" | "show_settings" | "none"
+- query_assignee: string or null
+- setting_key: string or null
+- setting_value: string or null
+- should_create_reminder: true if intent is create_reminder, else false
+- assignee: string or null
+- task: string or null
+- due_at: string or null
+- advance_notice_hours: integer or null (per-reminder override; null = use global default)
+- confidence: number 0.0-1.0
+- missing_fields: array of strings
+- reason: string or null`,
+      },
+      { role: 'user', content: text },
+    ],
+  });
+
+  return parseJSON(response.choices[0].message.content);
+}
+
+/**
+ * Detect if a thread reply is a modification or restore instruction.
+ */
+async function extractModification(text, referenceDate = new Date()) {
+  const jstNow = formatJST(referenceDate);
+
+  const response = await client.chat.completions.create({
+    model: MODEL,
+    max_tokens: 512,
+    response_format: { type: 'json_object' },
+    messages: [
+      {
+        role: 'system',
+        content: `You are a reminder modification assistant for a Japanese Slack workspace.
+Today's date and time (JST): ${jstNow}.
+
+Determine if this message is a modification instruction for an existing reminder.
+
+Respond with JSON:
+- action: "modify" | "restore" | null
+  - "modify": changing assignee or due date
+  - "restore": re-register a cancelled reminder (e.g. やっぱり登録して, 再登録, 復活)
+  - null: not a modification
+- assignee: new assignee as <@U...> or display name, or null
+- due_at: new ISO 8601 JST offset datetime, or null
+- reason: brief explanation`,
+      },
+      { role: 'user', content: text },
+    ],
+  });
+
+  return parseJSON(response.choices[0].message.content);
+}
+
+module.exports = { extractReminder, extractModification };

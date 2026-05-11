@@ -1,14 +1,27 @@
 const { extractReminder } = require('../ai');
-const { createReminder, setConfirmationTs } = require('../db');
-const { formatDueAt } = require('../utils');
+const {
+  createReminder, setConfirmationTs,
+  getAllPending, getPendingByAssignee,
+  getSetting, setSetting, getAllSettings,
+} = require('../db');
+const { formatDueAt, CONFIDENCE_THRESHOLD, DEFAULT_ADVANCE_NOTICE_HOURS } = require('../utils');
+const botConfig = require('../botConfig');
 
 async function handleMention({ event, client }) {
   const { text, channel, ts, thread_ts, user } = event;
-  // Replies go to the originating thread; top-level posts start a new thread
   const replyThreadTs = thread_ts || ts;
 
+  console.log(`[mention] user=${user} channel=${channel}`);
+
   try {
-    const extraction = await extractReminder(text);
+    const threadMessages = await fetchThreadContext(client, channel, thread_ts, ts);
+    const extraction = await extractReminder(text, new Date(), threadMessages);
+
+    switch (extraction.intent) {
+      case 'query_tasks':    return handleTaskQuery(extraction, channel, replyThreadTs, client);
+      case 'update_setting': return handleUpdateSetting(extraction, channel, replyThreadTs, client);
+      case 'show_settings':  return handleShowSettings(channel, replyThreadTs, client);
+    }
 
     if (!extraction.should_create_reminder) {
       await client.chat.postMessage({
@@ -19,9 +32,8 @@ async function handleMention({ event, client }) {
       return;
     }
 
-    // Ask for clarification when confidence is low or required fields are missing
-    if (extraction.confidence < 0.6 || (extraction.missing_fields && extraction.missing_fields.length > 0)) {
-      const missing = extraction.missing_fields && extraction.missing_fields.length > 0
+    if (extraction.confidence < CONFIDENCE_THRESHOLD || extraction.missing_fields?.length > 0) {
+      const missing = extraction.missing_fields?.length > 0
         ? extraction.missing_fields.join('、')
         : '日時または担当者';
       await client.chat.postMessage({
@@ -32,13 +44,7 @@ async function handleMention({ event, client }) {
       return;
     }
 
-    // Resolve Slack user ID from "<@U123456>" format if present
-    let assigneeSlackUserId = null;
-    const assigneeName = extraction.assignee || '(未設定)';
-    const mentionMatch = assigneeName.match(/^<@(U[A-Z0-9]+)>$/);
-    if (mentionMatch) {
-      assigneeSlackUserId = mentionMatch[1];
-    }
+    const { assigneeSlackUserId, assigneeName } = resolveAssignee(extraction.assignee);
 
     const reminderId = createReminder({
       task: extraction.task,
@@ -50,15 +56,19 @@ async function handleMention({ event, client }) {
       sourceThreadTs: replyThreadTs,
       createdBy: user,
       confidence: extraction.confidence,
+      advanceNoticeHours: extraction.advance_notice_hours ?? null,
     });
 
     const dueDisplay = formatDueAt(extraction.due_at);
     const assigneeDisplay = assigneeSlackUserId ? `<@${assigneeSlackUserId}>` : assigneeName;
+    const noticeHours = extraction.advance_notice_hours
+      ?? parseInt(getSetting('advance_notice_hours', String(DEFAULT_ADVANCE_NOTICE_HOURS)), 10);
+    const noticeLabel = formatHours(noticeHours);
 
     const confirmMsg = await client.chat.postMessage({
       channel,
       thread_ts: replyThreadTs,
-      text: `リマインド候補を作成しました。\n\n担当：${assigneeDisplay}\n期限：${dueDisplay}\n内容：${extraction.task}\n\n✅ 登録 / ❌ 無視`,
+      text: `リマインド候補を作成しました。\n担当：${assigneeDisplay}\n期限：${dueDisplay}\n内容：${extraction.task}`,
       blocks: [
         {
           type: 'section',
@@ -72,7 +82,7 @@ async function handleMention({ event, client }) {
           elements: [
             {
               type: 'mrkdwn',
-              text: `確信度：${Math.round(extraction.confidence * 100)}%　|　✅ でリアクションすると登録、❌ でキャンセル`,
+              text: `確信度：${Math.round(extraction.confidence * 100)}%　|　事前通知：${noticeLabel}前　|　✅ 登録　❌ キャンセル　※スレッドに返信で修正可`,
             },
           ],
         },
@@ -80,18 +90,117 @@ async function handleMention({ event, client }) {
     });
 
     setConfirmationTs(reminderId, confirmMsg.ts);
-
-    // Add reaction affordances so users see them immediately
     await client.reactions.add({ channel, timestamp: confirmMsg.ts, name: 'white_check_mark' });
     await client.reactions.add({ channel, timestamp: confirmMsg.ts, name: 'x' });
   } catch (err) {
-    console.error('Error in handleMention:', err);
+    console.error('[mention] Error:', err);
     await client.chat.postMessage({
       channel,
       thread_ts: replyThreadTs,
       text: 'エラーが発生しました。しばらく後にもう一度お試しください。',
     });
   }
+}
+
+// ── Intent handlers ───────────────────────────────────────────────────────────
+
+async function handleTaskQuery(extraction, channel, replyThreadTs, client) {
+  const queryUserId = extractUserId(extraction.query_assignee);
+  const reminders = queryUserId ? getPendingByAssignee(queryUserId) : getAllPending();
+  const headerText = queryUserId ? `<@${queryUserId}> のタスク一覧` : 'ペンディングタスク一覧';
+
+  if (reminders.length === 0) {
+    await client.chat.postMessage({
+      channel,
+      thread_ts: replyThreadTs,
+      text: `*${headerText}*\n\n現在ペンディング中のタスクはありません。`,
+    });
+    return;
+  }
+
+  const lines = reminders.map((r, i) => {
+    const assignee = r.assignee_slack_user_id ? `<@${r.assignee_slack_user_id}>` : r.assignee_name;
+    const statusLabel = r.status === 'draft' ? '未確認' : '確認済み';
+    return `${i + 1}. *${r.task}*\n　担当：${assignee}　期限：${formatDueAt(r.due_at)}　[${statusLabel}]`;
+  });
+
+  await client.chat.postMessage({
+    channel,
+    thread_ts: replyThreadTs,
+    text: `*${headerText}*\n\n${lines.join('\n\n')}`,
+  });
+}
+
+async function handleUpdateSetting(extraction, channel, replyThreadTs, client) {
+  const { setting_key: key, setting_value: value } = extraction;
+
+  if (key === 'advance_notice_hours') {
+    const hours = parseInt(value, 10);
+    if (!Number.isFinite(hours) || hours < 0) {
+      await client.chat.postMessage({
+        channel,
+        thread_ts: replyThreadTs,
+        text: '設定値が正しくありません。例：`@Reminder Bot 設定: 事前通知 2日前`',
+      });
+      return;
+    }
+    setSetting('advance_notice_hours', String(hours));
+    await client.chat.postMessage({
+      channel,
+      thread_ts: replyThreadTs,
+      text: `⚙️ 設定を更新しました。\n*事前通知タイミング：* ${formatHours(hours)}前\n\n※ 個別のリマインドで「X日前に通知」と指定するとそちらが優先されます。`,
+    });
+    return;
+  }
+
+  await client.chat.postMessage({
+    channel,
+    thread_ts: replyThreadTs,
+    text: `不明な設定キーです：\`${key}\``,
+  });
+}
+
+async function handleShowSettings(channel, replyThreadTs, client) {
+  const advanceHours = parseInt(getSetting('advance_notice_hours', String(DEFAULT_ADVANCE_NOTICE_HOURS)), 10);
+  await client.chat.postMessage({
+    channel,
+    thread_ts: replyThreadTs,
+    text: `⚙️ *現在の設定*\n\n*事前通知タイミング：* ${formatHours(advanceHours)}前（デフォルト）`,
+  });
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+async function fetchThreadContext(client, channel, thread_ts, currentTs) {
+  if (!thread_ts) return [];
+  try {
+    const result = await client.conversations.replies({ channel, ts: thread_ts, limit: 10 });
+    return (result.messages || [])
+      .filter(m => m.user && m.user !== botConfig.botUserId && m.ts !== currentTs)
+      .slice(-5)
+      .map(m => ({ user: m.user, text: m.text }));
+  } catch (e) {
+    console.error('[mention] Failed to fetch thread context:', e.message);
+    return [];
+  }
+}
+
+function resolveAssignee(rawAssignee) {
+  const name = rawAssignee || '(未設定)';
+  const m = name.match(/^<@(U[A-Z0-9]+)>$/) || name.match(/^(U[A-Z0-9]{6,})$/);
+  if (m) return { assigneeSlackUserId: m[1], assigneeName: `<@${m[1]}>` };
+  return { assigneeSlackUserId: null, assigneeName: name };
+}
+
+function extractUserId(raw) {
+  if (!raw) return null;
+  const m = raw.match(/^<@(U[A-Z0-9]+)>$/) || raw.match(/^(U[A-Z0-9]{6,})$/);
+  return m ? m[1] : null;
+}
+
+function formatHours(hours) {
+  if (hours % 24 === 0) return `${hours / 24}日`;
+  return `${hours}時間`;
 }
 
 module.exports = { handleMention };
