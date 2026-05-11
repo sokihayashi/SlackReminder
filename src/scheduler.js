@@ -1,6 +1,6 @@
 const cron = require('node-cron');
-const { getPendingDueReminders, markSent, markFailed, getRemindersForAdvanceNotice, markAdvanceNotified } = require('./db');
-const { formatDueAt } = require('./utils');
+const { getPendingDueReminders, getUnnotifiedPendingReminders, markSent, markFailed, markAdvanceNotified, getSetting } = require('./db');
+const { formatDueAt, DEFAULT_ADVANCE_NOTICE_HOURS } = require('./utils');
 
 function startScheduler(client) {
   cron.schedule('* * * * *', async () => {
@@ -12,29 +12,37 @@ function startScheduler(client) {
 }
 
 async function processAdvanceNotices(client) {
-  const reminders = getRemindersForAdvanceNotice();
-  for (const reminder of reminders) {
+  const globalHours = parseInt(getSetting('advance_notice_hours', String(DEFAULT_ADVANCE_NOTICE_HOURS)), 10);
+  const now = Date.now();
+
+  const candidates = getUnnotifiedPendingReminders();
+  for (const reminder of candidates) {
+    const windowHours = reminder.advance_notice_hours ?? globalHours;
+    const noticeAt = new Date(reminder.due_at).getTime() - windowHours * 60 * 60 * 1000;
+    if (noticeAt > now) continue;
+
     if (!reminder.assignee_slack_user_id) {
       markAdvanceNotified(reminder.id);
       continue;
     }
     try {
       const dmResult = await client.conversations.open({ users: reminder.assignee_slack_user_id });
+      const hoursLabel = windowHours % 24 === 0 ? `${windowHours / 24}日` : `${windowHours}時間`;
       await client.chat.postMessage({
         channel: dmResult.channel.id,
-        text: `*⏰ 明日期限のリマインドです。*\n\n内容：${reminder.task}\n期限：${formatDueAt(reminder.due_at)}\n依頼元：<#${reminder.source_channel_id}>`,
+        text: `*⏰ ${hoursLabel}後に期限のリマインドです。*\n\n内容：${reminder.task}\n期限：${formatDueAt(reminder.due_at)}\n依頼元：<#${reminder.source_channel_id}>`,
         blocks: [
           {
             type: 'section',
             text: {
               type: 'mrkdwn',
-              text: `*⏰ 明日期限のリマインドです。*\n\n*内容：* ${reminder.task}\n*期限：* ${formatDueAt(reminder.due_at)}\n*依頼元：* <#${reminder.source_channel_id}>`,
+              text: `*⏰ ${hoursLabel}後に期限のリマインドです。*\n\n*内容：* ${reminder.task}\n*期限：* ${formatDueAt(reminder.due_at)}\n*依頼元：* <#${reminder.source_channel_id}>`,
             },
           },
         ],
       });
       markAdvanceNotified(reminder.id);
-      console.log(`[scheduler] Advance notice sent for ${reminder.id} → ${reminder.assignee_slack_user_id}`);
+      console.log(`[scheduler] Advance notice sent for ${reminder.id} → ${reminder.assignee_slack_user_id} (${hoursLabel}前)`);
     } catch (err) {
       console.error(`[scheduler] Advance notice failed for ${reminder.id}:`, err.message);
     }
