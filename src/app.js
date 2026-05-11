@@ -7,6 +7,8 @@ const { handleReaction } = require('./handlers/reaction');
 const { startScheduler } = require('./scheduler');
 
 const { handleThreadReply } = require('./handlers/thread');
+const { setSetting } = require('./db');
+const { formatHours } = require('./utils');
 
 // Validate required environment variables at startup
 const required = ['SLACK_BOT_TOKEN', 'SLACK_SIGNING_SECRET', 'OPENROUTER_API_KEY'];
@@ -37,6 +39,29 @@ app.use(async ({ payload, next }) => {
 // Register event handlers before starting
 app.event('app_mention', handleMention);
 app.event('reaction_added', handleReaction);
+
+// Action handler: advance notice timing buttons
+// action_id format: set_advance_notice_hours__<hours>
+app.action(/^set_advance_notice_hours__\d+$/, async ({ body, ack, client }) => {
+  await ack();
+  const hours = parseInt(body.actions[0].value, 10);
+  setSetting('advance_notice_hours', String(hours));
+  const label = formatHours(hours);
+  await client.chat.update({
+    channel: body.channel.id,
+    ts: body.message.ts,
+    text: `⚙️ 事前通知タイミングを ${label}前 に更新しました。`,
+    blocks: [
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: `⚙️ *事前通知タイミングを更新しました*\n\n*${label}前* ✅`,
+        },
+      },
+    ],
+  });
+});
 
 // Thread reply handler: modification and restore instructions
 app.message(async ({ message, client }) => {

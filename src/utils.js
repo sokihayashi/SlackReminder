@@ -26,4 +26,9 @@ function formatJST(date) {
   }).format(date);
 }
 
-module.exports = { formatDueAt, formatJST, CONFIDENCE_THRESHOLD, DEFAULT_ADVANCE_NOTICE_HOURS };
+function formatHours(hours) {
+  if (hours % 24 === 0) return `${hours / 24}日`;
+  return `${hours}時間`;
+}
+
+module.exports = { formatDueAt, formatJST, formatHours, CONFIDENCE_THRESHOLD, DEFAULT_ADVANCE_NOTICE_HOURS };

@@ -4,7 +4,7 @@ const {
   getAllPending, getPendingByAssignee,
   getSetting, setSetting, getAllSettings,
 } = require('../db');
-const { formatDueAt, CONFIDENCE_THRESHOLD, DEFAULT_ADVANCE_NOTICE_HOURS } = require('../utils');
+const { formatDueAt, formatHours, CONFIDENCE_THRESHOLD, DEFAULT_ADVANCE_NOTICE_HOURS } = require('../utils');
 const botConfig = require('../botConfig');
 
 async function handleMention({ event, client }) {
@@ -84,7 +84,7 @@ async function handleMention({ event, client }) {
           elements: [
             {
               type: 'mrkdwn',
-              text: `確信度：${Math.round(extraction.confidence * 100)}%　|　事前通知：${noticeLabel}前　|　✅ 登録　❌ キャンセル　※スレッドに返信で修正可`,
+              text: `事前通知：${noticeLabel}前　|　✅ 登録　❌ キャンセル　※スレッドに返信で修正可`,
             },
           ],
         },
@@ -138,20 +138,18 @@ async function handleUpdateSetting(extraction, channel, replyThreadTs, client) {
 
   if (key === 'advance_notice_hours') {
     const hours = parseInt(value, 10);
-    if (!Number.isFinite(hours) || hours < 0) {
+    if (Number.isFinite(hours) && hours >= 0) {
+      // 具体的な時間が指定された場合はすぐ保存
+      setSetting('advance_notice_hours', String(hours));
       await client.chat.postMessage({
         channel,
         thread_ts: replyThreadTs,
-        text: '設定値が正しくありません。例：`@Reminder Bot 設定: 事前通知 2日前`',
+        text: `⚙️ 事前通知タイミングを *${formatHours(hours)}前* に設定しました。`,
       });
-      return;
+    } else {
+      // 時間が不明な場合はボタンを表示
+      await postAdvanceNoticeButtons(channel, replyThreadTs, client);
     }
-    setSetting('advance_notice_hours', String(hours));
-    await client.chat.postMessage({
-      channel,
-      thread_ts: replyThreadTs,
-      text: `⚙️ 設定を更新しました。\n*事前通知タイミング：* ${formatHours(hours)}前\n\n※ 個別のリマインドで「X日前に通知」と指定するとそちらが優先されます。`,
-    });
     return;
   }
 
@@ -195,10 +193,60 @@ async function handleShowSettings(channel, replyThreadTs, client) {
   const summaryLine = summaryChannelId
     ? `*週次サマリー：* <#${summaryChannelId}>（毎週月曜 9:00）`
     : `*週次サマリー：* 未設定`;
+
   await client.chat.postMessage({
     channel,
     thread_ts: replyThreadTs,
-    text: `⚙️ *現在の設定*\n\n*事前通知タイミング：* ${formatHours(advanceHours)}前（デフォルト）\n${summaryLine}`,
+    text: `⚙️ 現在の設定`,
+    blocks: [
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: `⚙️ *現在の設定*\n\n*事前通知タイミング：* ${formatHours(advanceHours)}前\n${summaryLine}`,
+        },
+      },
+      { type: 'divider' },
+      {
+        type: 'section',
+        text: { type: 'mrkdwn', text: '*事前通知タイミングを変更：*' },
+      },
+      advanceNoticeActionsBlock(),
+    ],
+  });
+}
+
+function advanceNoticeActionsBlock() {
+  const options = [
+    { label: '12時間前', value: '12' },
+    { label: '1日前',   value: '24' },
+    { label: '2日前',   value: '48' },
+    { label: '3日前',   value: '72' },
+    { label: '1週間前', value: '168' },
+  ];
+  return {
+    type: 'actions',
+    elements: options.map(o => ({
+      type: 'button',
+      text: { type: 'plain_text', text: o.label },
+      value: o.value,
+      action_id: `set_advance_notice_hours__${o.value}`,
+    })),
+  };
+}
+
+async function postAdvanceNoticeButtons(channel, replyThreadTs, client) {
+  await client.chat.postMessage({
+    channel,
+    thread_ts: replyThreadTs,
+    text: '事前通知タイミングを選択してください',
+    blocks: [
+      {
+        type: 'section',
+        text: { type: 'mrkdwn', text: '⚙️ *事前通知タイミングを選択してください：*' },
+      },
+      advanceNoticeActionsBlock(),
+    ],
   });
 }
 
@@ -229,11 +277,6 @@ function extractUserId(raw) {
   if (!raw) return null;
   const m = raw.match(/^<@(U[A-Z0-9]+)>$/) || raw.match(/^(U[A-Z0-9]{6,})$/);
   return m ? m[1] : null;
-}
-
-function formatHours(hours) {
-  if (hours % 24 === 0) return `${hours / 24}日`;
-  return `${hours}時間`;
 }
 
 module.exports = { handleMention };
