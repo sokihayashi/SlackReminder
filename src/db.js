@@ -21,6 +21,7 @@ db.exec(`
     ai_confidence REAL,
     advance_notified INTEGER NOT NULL DEFAULT 0,
     advance_notice_hours INTEGER,
+    notification_target TEXT NOT NULL DEFAULT 'dm',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
   );
@@ -36,6 +37,7 @@ db.exec(`
 for (const sql of [
   `ALTER TABLE reminders ADD COLUMN advance_notified INTEGER NOT NULL DEFAULT 0`,
   `ALTER TABLE reminders ADD COLUMN advance_notice_hours INTEGER`,
+  `ALTER TABLE reminders ADD COLUMN notification_target TEXT NOT NULL DEFAULT 'dm'`,
 ]) {
   try { db.exec(sql); } catch (_) { /* already exists */ }
 }
@@ -60,23 +62,29 @@ function getAllSettings() {
 
 // ── Reminders ─────────────────────────────────────────────────────────────────
 
-function createReminder({ task, assigneeName, assigneeSlackUserId, dueAt, sourceChannelId, sourceMessageTs, sourceThreadTs, createdBy, confidence, advanceNoticeHours }) {
+function createReminder({ task, assigneeName, assigneeSlackUserId, dueAt, sourceChannelId, sourceMessageTs, sourceThreadTs, createdBy, confidence, advanceNoticeHours, notificationTarget = 'dm' }) {
   const now = new Date().toISOString();
   const id = uuidv4();
   db.prepare(`
     INSERT INTO reminders
       (id, task, assignee_name, assignee_slack_user_id, due_at, source_channel_id, source_message_ts,
-       source_thread_ts, status, created_by, ai_confidence, advance_notified, advance_notice_hours, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, 0, ?, ?, ?)
+       source_thread_ts, status, created_by, ai_confidence, advance_notified, advance_notice_hours, notification_target, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, 0, ?, ?, ?, ?)
   `).run(
     id, task, assigneeName, assigneeSlackUserId,
     new Date(dueAt).toISOString(),
     sourceChannelId, sourceMessageTs, sourceThreadTs,
     createdBy, confidence,
     advanceNoticeHours ?? null,
+    notificationTarget,
     now, now,
   );
   return id;
+}
+
+function setNotificationTarget(id, target) {
+  db.prepare(`UPDATE reminders SET notification_target = ?, updated_at = ? WHERE id = ?`)
+    .run(target, new Date().toISOString(), id);
 }
 
 function setConfirmationTs(id, confirmationMessageTs) {
@@ -184,6 +192,7 @@ module.exports = {
   getAllSettings,
   // reminders
   createReminder,
+  setNotificationTarget,
   setConfirmationTs,
   findByConfirmationTs,
   findDraftByConfirmationTs,
