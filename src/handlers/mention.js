@@ -18,9 +18,11 @@ async function handleMention({ event, client }) {
     const extraction = await extractReminder(text, new Date(), threadMessages);
 
     switch (extraction.intent) {
-      case 'query_tasks':    return handleTaskQuery(extraction, channel, replyThreadTs, client);
-      case 'update_setting': return handleUpdateSetting(extraction, channel, replyThreadTs, client);
-      case 'show_settings':  return handleShowSettings(channel, replyThreadTs, client);
+      case 'query_tasks':           return handleTaskQuery(extraction, channel, replyThreadTs, client);
+      case 'update_setting':        return handleUpdateSetting(extraction, channel, replyThreadTs, client);
+      case 'set_summary_channel':   return handleSetSummaryChannel(channel, replyThreadTs, client);
+      case 'remove_summary_channel':return handleRemoveSummaryChannel(channel, replyThreadTs, client);
+      case 'show_settings':         return handleShowSettings(channel, replyThreadTs, client);
     }
 
     if (!extraction.should_create_reminder) {
@@ -160,12 +162,43 @@ async function handleUpdateSetting(extraction, channel, replyThreadTs, client) {
   });
 }
 
-async function handleShowSettings(channel, replyThreadTs, client) {
-  const advanceHours = parseInt(getSetting('advance_notice_hours', String(DEFAULT_ADVANCE_NOTICE_HOURS)), 10);
+async function handleSetSummaryChannel(channel, replyThreadTs, client) {
+  setSetting('summary_channel_id', channel);
   await client.chat.postMessage({
     channel,
     thread_ts: replyThreadTs,
-    text: `⚙️ *現在の設定*\n\n*事前通知タイミング：* ${formatHours(advanceHours)}前（デフォルト）`,
+    text: `📋 このチャンネルを週次タスクサマリーの送信先に設定しました。\n毎週月曜 9:00 にペンディングタスクをまとめて投稿します。`,
+  });
+}
+
+async function handleRemoveSummaryChannel(channel, replyThreadTs, client) {
+  const current = getSetting('summary_channel_id');
+  if (current !== channel) {
+    await client.chat.postMessage({
+      channel,
+      thread_ts: replyThreadTs,
+      text: 'このチャンネルはサマリー送信先として設定されていません。',
+    });
+    return;
+  }
+  setSetting('summary_channel_id', '');
+  await client.chat.postMessage({
+    channel,
+    thread_ts: replyThreadTs,
+    text: '📋 週次タスクサマリーの設定を解除しました。',
+  });
+}
+
+async function handleShowSettings(channel, replyThreadTs, client) {
+  const advanceHours = parseInt(getSetting('advance_notice_hours', String(DEFAULT_ADVANCE_NOTICE_HOURS)), 10);
+  const summaryChannelId = getSetting('summary_channel_id', '');
+  const summaryLine = summaryChannelId
+    ? `*週次サマリー：* <#${summaryChannelId}>（毎週月曜 9:00）`
+    : `*週次サマリー：* 未設定`;
+  await client.chat.postMessage({
+    channel,
+    thread_ts: replyThreadTs,
+    text: `⚙️ *現在の設定*\n\n*事前通知タイミング：* ${formatHours(advanceHours)}前（デフォルト）\n${summaryLine}`,
   });
 }
 

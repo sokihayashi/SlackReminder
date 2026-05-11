@@ -56,11 +56,15 @@ Intent options:
 - "update_setting": user wants to change a bot setting (e.g. 設定: 事前通知 2日前, デフォルト通知を3日前に)
   → setting_key: "advance_notice_hours"
   → setting_value: integer string (e.g. "48" for 2日前)
+- "set_summary_channel": user wants this channel to receive the weekly task summary
+  (e.g. このチャンネルにタスクサマリーを設定, ここに週次サマリーを送って, このチャンネルで月曜まとめ)
+- "remove_summary_channel": user wants to stop summary in this channel
+  (e.g. サマリーを解除, 週次まとめを止めて)
 - "show_settings": user wants to see current settings (e.g. 設定確認, 現在の設定)
 - "none": casual conversation or unclear
 
 Respond with JSON:
-- intent: "create_reminder" | "query_tasks" | "update_setting" | "show_settings" | "none"
+- intent: "create_reminder" | "query_tasks" | "update_setting" | "set_summary_channel" | "remove_summary_channel" | "show_settings" | "none"
 - query_assignee: string or null
 - setting_key: string or null
 - setting_value: string or null
