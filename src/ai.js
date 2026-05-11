@@ -59,7 +59,9 @@ Respond with a JSON object with exactly these fields:
     ],
   });
 
-  return JSON.parse(response.choices[0].message.content);
+  const raw = response.choices[0].message.content;
+  const cleaned = raw.replace(/^```(?:json)?\s*/m, '').replace(/\s*```\s*$/m, '').trim();
+  return JSON.parse(cleaned);
 }
 
 module.exports = { extractReminder };
