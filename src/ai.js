@@ -38,6 +38,8 @@ async function extractReminder(text, referenceDate = new Date()) {
 Extract reminder information from Slack messages. Today's date and time (JST): ${jstNow}.
 
 Rules:
+- The message starts with a mention of the bot itself (e.g. <@U0B2X4666MU>) — ignore this first mention when identifying the assignee
+- Any other <@UXXXXXXX> mention in the message is the assignee
 - Interpret relative dates (明日, 来週, 今週中, etc.) based on the JST current time above
 - If a date is given but no time, default to 10:00 JST
 - If "前日にリマインド" or similar, subtract one day from the deadline for due_at
