@@ -1,0 +1,43 @@
+name: Slack Reminder Bot
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */5 * * *'  # 5時間ごとに再起動
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Restore database
+        uses: actions/cache/restore@v4
+        with:
+          path: reminders.db
+          key: reminders-db-${{ github.run_number }}
+          restore-keys: reminders-db-
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run bot
+        timeout-minutes: 280
+        run: npm start
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_APP_TOKEN: ${{ secrets.SLACK_APP_TOKEN }}
+          SLACK_SIGNING_SECRET: ${{ secrets.SLACK_SIGNING_SECRET }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      - name: Save database
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: reminders.db
+          key: reminders-db-${{ github.run_number }}
