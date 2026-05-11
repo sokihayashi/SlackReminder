@@ -15,7 +15,7 @@
     "better-sqlite3": "^9.6.0",
     "dotenv": "^16.4.5",
     "node-cron": "^3.0.3",
-    "openai": "^4.52.7",
+    "@anthropic-ai/sdk": "^0.39.0",
     "uuid": "^10.0.0"
   }
 }

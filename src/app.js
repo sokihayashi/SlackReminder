@@ -7,7 +7,7 @@ const { handleReaction } = require('./handlers/reaction');
 const { startScheduler } = require('./scheduler');
 
 // Validate required environment variables at startup
-const required = ['SLACK_BOT_TOKEN', 'SLACK_SIGNING_SECRET', 'OPENAI_API_KEY'];
+const required = ['SLACK_BOT_TOKEN', 'SLACK_SIGNING_SECRET', 'ANTHROPIC_API_KEY'];
 for (const key of required) {
   if (!process.env[key]) {
     console.error(`Missing required environment variable: ${key}`);
