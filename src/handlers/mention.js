@@ -157,6 +157,18 @@ async function handleCancelReminder(text, channel, replyThreadTs, client) {
     return;
   }
 
+  // Cancel-all shortcut: "全部", "すべて", "全て", "全キャン" etc.
+  const bare = text.replace(/<@[^>]+>/g, '').trim();
+  if (/全部|すべて|全て|全キャン/.test(bare)) {
+    for (const r of pending) cancelReminder(r.id);
+    await client.chat.postMessage({
+      channel,
+      thread_ts: replyThreadTs,
+      text: `❌ ${pending.length}件のリマインドをすべてキャンセルしました。`,
+    });
+    return;
+  }
+
   const { reminder_id } = await resolveCancelTarget(text, pending);
 
   if (!reminder_id) {
