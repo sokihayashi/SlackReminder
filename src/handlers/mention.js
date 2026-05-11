@@ -26,7 +26,7 @@ async function handleMention({ event, client }) {
 
     switch (extraction.intent) {
       case 'query_tasks':           return handleTaskQuery(extraction, channel, replyThreadTs, client);
-      case 'cancel_reminder':       return handleCancelReminder(text, extraction, channel, replyThreadTs, client);
+      case 'cancel_reminder':       return handleCancelReminder(text, channel, replyThreadTs, client);
       case 'update_setting':        return handleUpdateSetting(extraction, channel, replyThreadTs, client);
       case 'set_summary_channel':   return handleSetSummaryChannel(channel, replyThreadTs, client);
       case 'remove_summary_channel':return handleRemoveSummaryChannel(channel, replyThreadTs, client);
@@ -145,7 +145,7 @@ async function handleTaskQuery(extraction, channel, replyThreadTs, client) {
   });
 }
 
-async function handleCancelReminder(text, extraction, channel, replyThreadTs, client) {
+async function handleCancelReminder(text, channel, replyThreadTs, client) {
   const pending = getAllPending();
 
   if (pending.length === 0) {
@@ -157,63 +157,28 @@ async function handleCancelReminder(text, extraction, channel, replyThreadTs, cl
     return;
   }
 
-  // Cancel-all shortcut: "全部", "すべて", "全て", "全キャン" etc.
-  const bare = text.replace(/<@[^>]+>/g, '').trim();
-  if (/全部|すべて|全て|全キャン/.test(bare)) {
-    for (const r of pending) cancelReminder(r.id);
-    await client.chat.postMessage({
-      channel,
-      thread_ts: replyThreadTs,
-      text: `❌ ${pending.length}件のリマインドをすべてキャンセルしました。`,
-    });
-    return;
+  const { scope, reminder_id, assignee_filter } = await resolveCancelTarget(text, pending);
+
+  switch (scope) {
+    case 'all':         return cancelAll(pending, channel, replyThreadTs, client);
+    case 'one':         return cancelOne(reminder_id, pending, channel, replyThreadTs, client);
+    case 'by_assignee': return cancelByAssignee(assignee_filter, pending, channel, replyThreadTs, client);
+    default:            return showAmbiguousList(pending, channel, replyThreadTs, client);
   }
+}
 
-  const { reminder_id } = await resolveCancelTarget(text, pending);
+async function cancelAll(pending, channel, replyThreadTs, client) {
+  for (const r of pending) cancelReminder(r.id);
+  await client.chat.postMessage({
+    channel,
+    thread_ts: replyThreadTs,
+    text: `❌ ${pending.length}件のリマインドをすべてキャンセルしました。`,
+  });
+}
 
-  if (!reminder_id) {
-    // Fallback: assignee-based bulk cancel when AI extracted a cancel_assignee
-    const cancelAssignee = extraction.cancel_assignee;
-    if (cancelAssignee) {
-      const assigneeId = extractUserId(cancelAssignee);
-      const matched = pending.filter(r =>
-        assigneeId
-          ? r.assignee_slack_user_id === assigneeId
-          : r.assignee_name?.includes(cancelAssignee)
-      );
-      if (matched.length > 0) {
-        for (const r of matched) cancelReminder(r.id);
-        const label = assigneeId ? `<@${assigneeId}>` : cancelAssignee;
-        await client.chat.postMessage({
-          channel,
-          thread_ts: replyThreadTs,
-          text: `❌ ${label} のリマインドを ${matched.length}件キャンセルしました。`,
-        });
-        return;
-      }
-    }
-
-    const lines = pending.map((r, i) => {
-      const assignee = displayAssignee(r);
-      return `${i + 1}. *${r.task}*　担当：${assignee}　期限：${formatDueAt(r.due_at)}`;
-    });
-    await client.chat.postMessage({
-      channel,
-      thread_ts: replyThreadTs,
-      text: `キャンセル対象を特定できませんでした。確認メッセージの ❌ でキャンセルするか、もう少し詳しく教えてください。\n\n${lines.join('\n')}`,
-    });
-    return;
-  }
-
-  const r = pending.find(p => p.id === reminder_id);
-  if (!r) {
-    await client.chat.postMessage({
-      channel,
-      thread_ts: replyThreadTs,
-      text: 'キャンセル対象のペンディングリマインドが見つかりませんでした。',
-    });
-    return;
-  }
+async function cancelOne(reminderId, pending, channel, replyThreadTs, client) {
+  const r = pending.find(p => p.id === reminderId);
+  if (!r) return showAmbiguousList(pending, channel, replyThreadTs, client);
 
   cancelReminder(r.id);
   const assignee = displayAssignee(r);
@@ -221,6 +186,38 @@ async function handleCancelReminder(text, extraction, channel, replyThreadTs, cl
     channel,
     thread_ts: replyThreadTs,
     text: `❌ リマインドをキャンセルしました。\n*内容：* ${r.task}　*担当：* ${assignee}　*期限：* ${formatDueAt(r.due_at)}`,
+  });
+}
+
+async function cancelByAssignee(assigneeFilter, pending, channel, replyThreadTs, client) {
+  if (!assigneeFilter) return showAmbiguousList(pending, channel, replyThreadTs, client);
+
+  const assigneeId = extractUserId(assigneeFilter);
+  const matched = pending.filter(r =>
+    assigneeId
+      ? r.assignee_slack_user_id === assigneeId
+      : r.assignee_name?.includes(assigneeFilter)
+  );
+  if (matched.length === 0) return showAmbiguousList(pending, channel, replyThreadTs, client);
+
+  for (const r of matched) cancelReminder(r.id);
+  const label = assigneeId ? `<@${assigneeId}>` : assigneeFilter;
+  await client.chat.postMessage({
+    channel,
+    thread_ts: replyThreadTs,
+    text: `❌ ${label} のリマインドを ${matched.length}件キャンセルしました。`,
+  });
+}
+
+async function showAmbiguousList(pending, channel, replyThreadTs, client) {
+  const lines = pending.map((r, i) => {
+    const assignee = displayAssignee(r);
+    return `${i + 1}. *${r.task}*　担当：${assignee}　期限：${formatDueAt(r.due_at)}`;
+  });
+  await client.chat.postMessage({
+    channel,
+    thread_ts: replyThreadTs,
+    text: `キャンセル対象を特定できませんでした。確認メッセージの ❌ でキャンセルするか、もう少し詳しく教えてください。\n\n${lines.join('\n')}`,
   });
 }
 

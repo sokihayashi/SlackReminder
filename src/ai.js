@@ -97,7 +97,7 @@ Intent options:
   → setting_key: "advance_notice_hours"
   → setting_value: integer string (e.g. "48" for 2日前)
 - "cancel_reminder": user wants to cancel an existing pending reminder
-  (e.g. はやしへのリマインド解除して, @田中のタスクをキャンセル, 編集のリマインド取り消し)
+  (e.g. はやしへのリマインド解除して, @田中のタスクをキャンセル, 編集のリマインド取り消し, 全部キャンセル, クリア, リセット)
   → set cancel_assignee to <@U...> or display name if a person is specified, else null
   → set cancel_task_hint to a keyword from the task description if specified, else null
 - "set_summary_channel": user wants this channel to receive the weekly task summary
@@ -131,33 +131,40 @@ Respond with JSON:
   return sanitizeExtraction(parseJSON(response.choices[0].message.content));
 }
 
+const VALID_CANCEL_SCOPES = ['all', 'one', 'by_assignee', 'none'];
+
 /**
- * Use AI to identify which pending reminder the user's cancel message refers to.
- * Returns { reminder_id: string|null, reason: string|null }.
+ * Use AI to determine the cancel scope and target.
+ * Returns { scope, reminder_id, assignee_filter, reason }.
+ *   scope: 'all' | 'one' | 'by_assignee' | 'none'
  */
 async function resolveCancelTarget(userMessage, pendingReminders) {
-  if (pendingReminders.length === 0) return { reminder_id: null, reason: 'no pending reminders' };
+  if (pendingReminders.length === 0) {
+    return { scope: 'none', reminder_id: null, assignee_filter: null, reason: 'no pending reminders' };
+  }
 
   const list = pendingReminders.map((r, i) =>
     `${i + 1}. id=${r.id}  担当=${r.assignee_name}  タスク=${r.task}  期限=${r.due_at}`
   ).join('\n');
 
+  const prompt = `あなたはSlackリマインドBotのキャンセル意図解析アシスタントです。\nユーザーのメッセージと現在のペンディングリマインド一覧から、何をキャンセルしたいかを判定してください。\n\nペンディング一覧:\n${list}\n\nscope の決め方:\n- "all": 対象を絞らず全部を消したい。例: 「全部キャンセル」「ぜんぶ消して」「クリア」「リセット」「全件削除」「リマインド全部やめて」「すべて取り消し」など意味的に「すべて対象」のとき。\n- "one": 一覧の中の特定1件を確実にロックオンできる場合のみ（担当・タスク・期限の組み合わせで一意に決まる）。\n- "by_assignee": 特定の担当者は明確だがその人の中で1件に絞れない／複数を一括で消したい。例: 「はやしのリマインド解除」「@田中のタスク全部キャンセル」「林さんのやつ消して」\n- "none": 上記いずれにも当てはまらない・あいまい・候補が複数で絞れない。\n\nRespond with JSON:\n- scope: "all" | "one" | "by_assignee" | "none"\n- reminder_id: string (scope="one" のときのみ、一覧の id) | null\n- assignee_filter: string (scope="by_assignee" のとき、一覧の担当=表記をそのままコピー。例: "<@U123>" または "はやし") | null\n- reason: 判断理由（短く）`;
+
   const response = await client.chat.completions.create({
     model: MODEL,
-    max_tokens: 256,
+    max_tokens: 512,
     response_format: { type: 'json_object' },
     messages: [
-      {
-        role: 'system',
-        content: `以下のペンディングリマインド一覧から、ユーザーのメッセージが指しているものを特定してください。\n\nペンディング一覧:\n${list}\n\nRespond with JSON:\n- reminder_id: string (一覧の id) | null (特定できない・複数候補)\n- reason: 判断理由`,
-      },
+      { role: 'system', content: prompt },
       { role: 'user', content: userMessage },
     ],
   });
 
   const parsed = parseJSON(response.choices[0].message.content);
+  const scope = VALID_CANCEL_SCOPES.includes(parsed.scope) ? parsed.scope : 'none';
   return {
-    reminder_id: typeof parsed.reminder_id === 'string' ? parsed.reminder_id : null,
+    scope,
+    reminder_id:     typeof parsed.reminder_id === 'string'     ? parsed.reminder_id     : null,
+    assignee_filter: typeof parsed.assignee_filter === 'string' ? parsed.assignee_filter : null,
     reason: parsed.reason ?? null,
   };
 }
