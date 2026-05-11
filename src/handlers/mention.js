@@ -1,6 +1,6 @@
 const { extractReminder } = require('../ai');
 const {
-  createReminder, setConfirmationTs,
+  createReminder, setConfirmationTs, setNotificationTarget,
   getAllPending, getPendingByAssignee,
   getSetting, setSetting, getAllSettings,
 } = require('../db');
@@ -55,6 +55,8 @@ async function handleMention({ event, client }) {
 
     const { assigneeSlackUserId, assigneeName } = resolveAssignee(extraction.assignee);
 
+    const notifTarget = extraction.notification_target === 'thread' ? 'thread' : 'dm';
+
     const reminderId = createReminder({
       task: extraction.task,
       assigneeName,
@@ -66,6 +68,7 @@ async function handleMention({ event, client }) {
       createdBy: user,
       confidence: extraction.confidence,
       advanceNoticeHours: extraction.advance_notice_hours ?? null,
+      notificationTarget: notifTarget,
     });
 
     const dueDisplay = formatDueAt(extraction.due_at);
@@ -86,6 +89,7 @@ async function handleMention({ event, client }) {
             text: `*リマインド候補を作成しました。*\n\n*担当：* ${assigneeDisplay}\n*期限：* ${dueDisplay}\n*内容：* ${extraction.task}`,
           },
         },
+        notificationTargetBlock(notifTarget),
         {
           type: 'context',
           elements: [
@@ -221,6 +225,14 @@ async function handleShowSettings(channel, replyThreadTs, client) {
       advanceNoticeActionsBlock(),
     ],
   });
+}
+
+function notificationTargetBlock(current) {
+  const dm = { type: 'button', text: { type: 'plain_text', text: '📱 DM' }, value: 'dm', action_id: 'set_notification_target' };
+  const thread = { type: 'button', text: { type: 'plain_text', text: '💬 スレッド' }, value: 'thread', action_id: 'set_notification_target' };
+  if (current === 'dm') dm.style = 'primary';
+  else thread.style = 'primary';
+  return { type: 'actions', elements: [dm, thread] };
 }
 
 function advanceNoticeActionsBlock() {

@@ -7,7 +7,7 @@ const { handleReaction } = require('./handlers/reaction');
 const { startScheduler } = require('./scheduler');
 
 const { handleThreadReply } = require('./handlers/thread');
-const { setSetting } = require('./db');
+const { setSetting, setNotificationTarget, findByConfirmationTs } = require('./db');
 const { formatHours } = require('./utils');
 
 // Validate required environment variables at startup
@@ -61,6 +61,27 @@ app.action(/^set_advance_notice_hours__\d+$/, async ({ body, ack, client }) => {
       },
     ],
   });
+});
+
+// Action handler: notification target toggle (DM ↔ スレッド)
+app.action('set_notification_target', async ({ body, ack, client }) => {
+  await ack();
+  const target = body.actions[0].value;
+  const reminder = findByConfirmationTs(body.channel.id, body.message.ts);
+  if (!reminder) return;
+
+  setNotificationTarget(reminder.id, target);
+
+  const dm = { type: 'button', text: { type: 'plain_text', text: '📱 DM' }, value: 'dm', action_id: 'set_notification_target' };
+  const thread = { type: 'button', text: { type: 'plain_text', text: '💬 スレッド' }, value: 'thread', action_id: 'set_notification_target' };
+  if (target === 'dm') dm.style = 'primary'; else thread.style = 'primary';
+
+  const updatedBlocks = body.message.blocks.map(b =>
+    b.type === 'actions' && b.elements?.some(e => e.action_id === 'set_notification_target')
+      ? { type: 'actions', elements: [dm, thread] }
+      : b
+  );
+  await client.chat.update({ channel: body.channel.id, ts: body.message.ts, blocks: updatedBlocks, text: body.message.text });
 });
 
 // Thread reply handler: modification and restore instructions

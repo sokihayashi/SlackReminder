@@ -50,6 +50,8 @@ Intent options:
   → Ambiguous date → confidence < 0.6, add "due_at" to missing_fields
   → No clear assignee → add "assignee" to missing_fields
   → "X日前に通知" or "X時間前に通知" in the message → set advance_notice_hours accordingly
+  → "このスレッドに通知" / "チャンネルで通知" / "DMじゃなく" / "ここに通知" → notification_target: "thread"
+  → default notification_target: "dm"
   → due_at must be ISO 8601 with JST offset, e.g. "2026-05-20T10:00:00+09:00"
 - "query_tasks": user wants to list existing reminders (e.g. タスク一覧, 誰が何を, リスト)
   → set query_assignee to <@U...> if asking for a specific person, else null
@@ -73,6 +75,7 @@ Respond with JSON:
 - task: string or null
 - due_at: string or null
 - advance_notice_hours: integer or null (per-reminder override; null = use global default)
+- notification_target: "dm" | "thread"
 - confidence: number 0.0-1.0
 - missing_fields: array of strings
 - reason: string or null`,
