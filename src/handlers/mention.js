@@ -762,22 +762,18 @@ async function handlePassiveDetection({ message, client }) {
 }
 
 /**
- * Auto-crawl on channel join: when the bot itself is added to a channel,
- * fetch the recent history once and bulk-register any action items.
+ * Auto-crawl on channel join: silently scan the recent history and bulk-register
+ * any action items. Posts a single summary message only when reminders are
+ * actually created — otherwise stays quiet to avoid channel noise.
  */
 async function handleBotJoinedChannel({ event, client }) {
   if (!botConfig.botUserId || event.user !== botConfig.botUserId) return;
   const channel = event.channel;
-  console.log(`[join] bot joined channel=${channel}; starting auto-crawl`);
+  console.log(`[join] bot joined channel=${channel}; starting background crawl`);
 
+  // Background extraction: silent unless tasks are actually registered.
   const messages = await fetchChannelHistory(client, channel, undefined, 100);
-  if (messages.length === 0) {
-    await client.chat.postMessage({
-      channel,
-      text: '👋 招待ありがとうございます。\n過去のメッセージは見つかりませんでしたが、これ以降の `<@user> + 期限` を含むメッセージを自動で拾います。\n手動で過去を拾い直したい時は `@Reminder Bot このチャンネルのタスクを抽出して` と話しかけてください。',
-    });
-    return;
-  }
+  if (messages.length === 0) return;
 
   let tasks;
   try {
@@ -787,31 +783,17 @@ async function handleBotJoinedChannel({ event, client }) {
     return;
   }
   const filtered = tasks.filter(t => t.confidence >= 0.5);
-
-  if (filtered.length === 0) {
-    await client.chat.postMessage({
-      channel,
-      text: `👋 招待ありがとうございます。直近 ${messages.length} 件をスキャンしましたが、タスクは見つかりませんでした。\n以降の \`<@user> + 期限\` を含むメッセージは自動で拾います。`,
-    });
-    return;
-  }
+  if (filtered.length === 0) return;
 
   const results = await bulkCreateReminders(filtered, {
     channelId: channel, messageTs: null, threadTs: null, user: botConfig.botUserId, notificationTarget: 'dm',
   }, client);
   const created = results.filter(r => r.status === 'created');
-
-  if (created.length === 0) {
-    await client.chat.postMessage({
-      channel,
-      text: `👋 招待ありがとうございます。タスク候補は見つかりましたが、担当者が特定できず登録できませんでした。`,
-    });
-    return;
-  }
+  if (created.length === 0) return;
 
   await client.chat.postMessage({
     channel,
-    text: `👋 招待ありがとうございます。過去メッセージから *${created.length} 件* のリマインドを自動登録しました。\n\n${formatBulkLines(results).join('\n\n')}\n\n_誤検出は「@Reminder Bot ○○のリマインドキャンセル」で削除できます。以降の \`<@user>+期限\` も自動で拾います。_`,
+    text: `🔔 過去メッセージから *${created.length} 件* のリマインドを自動登録しました。\n\n${formatBulkLines(results).join('\n\n')}\n\n_誤検出は「@Reminder Bot ○○のリマインドキャンセル」で削除できます。_`,
   });
 }
 
