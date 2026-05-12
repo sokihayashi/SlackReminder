@@ -10,7 +10,6 @@ const { startScheduler } = require('./scheduler');
 const { handleThreadReply } = require('./handlers/thread');
 const { setSetting, setNotificationTarget, findByConfirmationTs, approveReminder, cancelReminder, getPendingQuestion, deletePendingQuestion, recordBotSentMessage, getReminderById, updateReminder } = require('./db');
 const { formatHours, formatDueAt } = require('./utils');
-const { extractModification } = require('./ai');
 
 // Validate required environment variables at startup
 const required = ['SLACK_BOT_TOKEN', 'SLACK_SIGNING_SECRET', 'OPENROUTER_API_KEY'];
@@ -188,6 +187,17 @@ const ADVANCE_NOTICE_OPTIONS = [0, 1, 2, 3, 6, 12, 24, 48].map(h => ({
   value: String(h),
 }));
 
+// Convert a UTC ISO string to JST { date: 'YYYY-MM-DD', time: 'HH:MM' }
+function toJSTComponents(isoString) {
+  const d = new Date(isoString);
+  const j = new Date(d.getTime() + 9 * 60 * 60 * 1000);
+  const pad = n => String(n).padStart(2, '0');
+  return {
+    date: `${j.getUTCFullYear()}-${pad(j.getUTCMonth() + 1)}-${pad(j.getUTCDate())}`,
+    time: `${pad(j.getUTCHours())}:${pad(j.getUTCMinutes())}`,
+  };
+}
+
 app.action('bulk_modify_one', async ({ body, ack, client }) => {
   await ack();
   const reminderId = body.actions[0].value;
@@ -196,9 +206,22 @@ app.action('bulk_modify_one', async ({ body, ack, client }) => {
   const reminder = getReminderById(reminderId);
   if (!reminder) return;
 
+  // Resolve human-readable display name (avoid showing raw <@U...> in placeholder)
+  let assigneeLabel = reminder.assignee_name || '（未設定）';
+  if (reminder.assignee_slack_user_id) {
+    try {
+      const info = await client.users.info({ user: reminder.assignee_slack_user_id });
+      const p = info.user?.profile;
+      assigneeLabel = p?.display_name || p?.real_name || assigneeLabel;
+    } catch (_) {}
+  }
+
   const currentAdvanceOption = ADVANCE_NOTICE_OPTIONS.find(
     o => o.value === String(reminder.advance_notice_hours ?? '')
   );
+  const { date: curDate, time: curTime } = reminder.due_at
+    ? toJSTComponents(reminder.due_at)
+    : { date: undefined, time: undefined };
 
   await client.views.open({
     trigger_id: body.trigger_id,
@@ -214,7 +237,7 @@ app.action('bulk_modify_one', async ({ body, ack, client }) => {
           type: 'section',
           text: {
             type: 'mrkdwn',
-            text: `*タスク:* ${reminder.task}\n*担当:* ${reminder.assignee_name || '（未設定）'}　*期限:* ${formatDueAt(reminder.due_at)}`,
+            text: `*タスク:* ${reminder.task}\n*担当:* ${assigneeLabel}　*期限:* ${formatDueAt(reminder.due_at)}`,
           },
         },
         { type: 'divider' },
@@ -223,23 +246,37 @@ app.action('bulk_modify_one', async ({ body, ack, client }) => {
           block_id: 'assignee_block',
           optional: true,
           label: { type: 'plain_text', text: '担当者を変更' },
-          hint: { type: 'plain_text', text: '<@U...> 形式またはお名前。空欄 = 変更しない' },
+          hint: { type: 'plain_text', text: '@メンション形式またはお名前。空欄 = 変更しない' },
           element: {
             type: 'plain_text_input',
             action_id: 'assignee_input',
-            placeholder: { type: 'plain_text', text: `現在: ${reminder.assignee_name || '（未設定）'}` },
+            placeholder: { type: 'plain_text', text: `現在: ${assigneeLabel}` },
           },
         },
         {
           type: 'input',
-          block_id: 'due_at_block',
+          block_id: 'due_date_block',
           optional: true,
-          label: { type: 'plain_text', text: '期限を変更' },
-          hint: { type: 'plain_text', text: '例: 明日17時 / 5月20日 / 来週月曜。空欄 = 変更しない' },
+          label: { type: 'plain_text', text: '期限の日付を変更' },
+          hint: { type: 'plain_text', text: '空欄 = 変更しない' },
           element: {
-            type: 'plain_text_input',
-            action_id: 'due_at_input',
-            placeholder: { type: 'plain_text', text: `現在: ${formatDueAt(reminder.due_at)}` },
+            type: 'datepicker',
+            action_id: 'due_date_input',
+            placeholder: { type: 'plain_text', text: '日付を選択' },
+            ...(curDate ? { initial_date: curDate } : {}),
+          },
+        },
+        {
+          type: 'input',
+          block_id: 'due_time_block',
+          optional: true,
+          label: { type: 'plain_text', text: '期限の時刻を変更' },
+          hint: { type: 'plain_text', text: '日付を変更した場合は時刻も設定してください。空欄 = 変更しない' },
+          element: {
+            type: 'timepicker',
+            action_id: 'due_time_input',
+            placeholder: { type: 'plain_text', text: '時刻を選択' },
+            ...(curTime ? { initial_time: curTime } : {}),
           },
         },
         {
@@ -263,11 +300,12 @@ app.action('bulk_modify_one', async ({ body, ack, client }) => {
 app.view('bulk_modify_modal', async ({ body, ack, client, view }) => {
   await ack();
 
-  let { reminderId, channel, confirmationTs } = JSON.parse(view.private_metadata);
+  const { reminderId, channel, confirmationTs } = JSON.parse(view.private_metadata);
   const vals = view.state.values;
 
-  const assigneeRaw = vals.assignee_block?.assignee_input?.value?.trim() || null;
-  const dueAtRaw    = vals.due_at_block?.due_at_input?.value?.trim() || null;
+  const assigneeRaw     = vals.assignee_block?.assignee_input?.value?.trim() || null;
+  const selectedDate    = vals.due_date_block?.due_date_input?.selected_date || null;
+  const selectedTime    = vals.due_time_block?.due_time_input?.selected_time || null;
   const advanceHoursStr = vals.advance_notice_block?.advance_notice_select?.selected_option?.value ?? null;
 
   const update = {};
@@ -283,14 +321,9 @@ app.view('bulk_modify_modal', async ({ body, ack, client, view }) => {
     }
   }
 
-  if (dueAtRaw) {
-    try {
-      const reminder = getReminderById(reminderId);
-      const mod = await extractModification(`期限を ${dueAtRaw} に変更して`, reminder);
-      if (mod?.due_at) update.dueAt = mod.due_at;
-    } catch (e) {
-      console.error('[bulk_modify_modal] due_at parse error:', e.message);
-    }
+  if (selectedDate) {
+    const time = selectedTime || '10:00';
+    update.dueAt = `${selectedDate}T${time}:00+09:00`;
   }
 
   if (advanceHoursStr !== null) {
