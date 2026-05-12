@@ -3,7 +3,7 @@ name: Slack Reminder Bot
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */5 * * *'  # 5時間ごとに再起動
+    - cron: '0 */12 * * *'  # 12時間ごとのセーフティネット（通常は自己トリガーで継続）
 
 jobs:
   run-bot:
@@ -41,3 +41,9 @@ jobs:
         with:
           path: reminders.db
           key: reminders-db-${{ github.run_number }}
+
+      - name: Trigger next run
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: gh workflow run bot.yml --repo ${{ github.repository }}
