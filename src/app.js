@@ -2,7 +2,7 @@ require('dotenv').config();
 
 const { App, LogLevel } = require('@slack/bolt');
 const botConfig = require('./botConfig');
-const { handleMention, notificationTargetBlock, handlePassiveDetection } = require('./handlers/mention');
+const { handleMention, notificationTargetBlock, handlePassiveDetection, handleBotJoinedChannel } = require('./handlers/mention');
 const { handleReaction } = require('./handlers/reaction');
 const { startScheduler } = require('./scheduler');
 
@@ -39,6 +39,7 @@ app.use(async ({ payload, next }) => {
 // Register event handlers before starting
 app.event('app_mention', handleMention);
 app.event('reaction_added', handleReaction);
+app.event('member_joined_channel', handleBotJoinedChannel);
 
 // Action handler: advance notice timing buttons
 // action_id format: set_advance_notice_hours__<hours>

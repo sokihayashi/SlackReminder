@@ -631,10 +631,10 @@ async function fetchFullThread(client, channel, threadTs, currentTs) {
   }
 }
 
-async function fetchChannelHistory(client, channel, beforeTs) {
+async function fetchChannelHistory(client, channel, beforeTs, limit = 100) {
   const botPattern = botConfig.botUserId ? new RegExp(`<@${botConfig.botUserId}>`, 'g') : null;
   try {
-    const result = await client.conversations.history({ channel, latest: beforeTs, limit: 30, inclusive: false });
+    const result = await client.conversations.history({ channel, latest: beforeTs, limit, inclusive: false });
     return (result.messages || [])
       .filter(m => m.user && m.user !== botConfig.botUserId && m.text && !m.thread_ts)
       .reverse()
@@ -761,4 +761,58 @@ async function handlePassiveDetection({ message, client }) {
   });
 }
 
-module.exports = { handleMention, notificationTargetBlock, handlePassiveDetection };
+/**
+ * Auto-crawl on channel join: when the bot itself is added to a channel,
+ * fetch the recent history once and bulk-register any action items.
+ */
+async function handleBotJoinedChannel({ event, client }) {
+  if (!botConfig.botUserId || event.user !== botConfig.botUserId) return;
+  const channel = event.channel;
+  console.log(`[join] bot joined channel=${channel}; starting auto-crawl`);
+
+  const messages = await fetchChannelHistory(client, channel, undefined, 100);
+  if (messages.length === 0) {
+    await client.chat.postMessage({
+      channel,
+      text: '👋 招待ありがとうございます。\n過去のメッセージは見つかりませんでしたが、これ以降の `<@user> + 期限` を含むメッセージを自動で拾います。\n手動で過去を拾い直したい時は `@Reminder Bot このチャンネルのタスクを抽出して` と話しかけてください。',
+    });
+    return;
+  }
+
+  let tasks;
+  try {
+    tasks = await extractTasksFromThread(messages, new Date(), botConfig.botUserId);
+  } catch (err) {
+    console.error('[join] extractTasksFromThread error:', err.message);
+    return;
+  }
+  const filtered = tasks.filter(t => t.confidence >= 0.5);
+
+  if (filtered.length === 0) {
+    await client.chat.postMessage({
+      channel,
+      text: `👋 招待ありがとうございます。直近 ${messages.length} 件をスキャンしましたが、タスクは見つかりませんでした。\n以降の \`<@user> + 期限\` を含むメッセージは自動で拾います。`,
+    });
+    return;
+  }
+
+  const results = await bulkCreateReminders(filtered, {
+    channelId: channel, messageTs: null, threadTs: null, user: botConfig.botUserId, notificationTarget: 'dm',
+  }, client);
+  const created = results.filter(r => r.status === 'created');
+
+  if (created.length === 0) {
+    await client.chat.postMessage({
+      channel,
+      text: `👋 招待ありがとうございます。タスク候補は見つかりましたが、担当者が特定できず登録できませんでした。`,
+    });
+    return;
+  }
+
+  await client.chat.postMessage({
+    channel,
+    text: `👋 招待ありがとうございます。過去メッセージから *${created.length} 件* のリマインドを自動登録しました。\n\n${formatBulkLines(results).join('\n\n')}\n\n_誤検出は「@Reminder Bot ○○のリマインドキャンセル」で削除できます。以降の \`<@user>+期限\` も自動で拾います。_`,
+  });
+}
+
+module.exports = { handleMention, notificationTargetBlock, handlePassiveDetection, handleBotJoinedChannel };
