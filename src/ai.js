@@ -136,9 +136,12 @@ Intent options:
     Example: 「Aを借りて、Bを確保して、Cを確認して」 → 3 entries
     Example: 「QKからインカム借りて、段ボール確保、15日に制作チームに確認」 → 3 entries
   → If the user message lacks task details (e.g. just 「登録して」「リマインドして」「お願い」), look at Thread context above and extract action items discussed there.
-  → The user's bot mention is already stripped. Any remaining <@UXXXXXXX> is the assignee (a human, never the bot itself).
-  → Per-task assignee resolution: prefer <@UXXX> mentioned with the task; fall back to thread context. Never use the bot.
-  → If a task lacks a clear human assignee, leave assignee=null and add "assignee" to missing_fields (overall).
+  → **ASSIGNEE EXTRACTION (重要)**: The user's bot mention has already been stripped from the input.
+    - Rule A: Any remaining <@UXXXXXXX> in the user's message IS the per-task assignee. Copy it verbatim to tasks[].assignee (e.g. "<@U12345>"). This applies even if the mentioned user is the message sender themselves — self-reminders are valid and common.
+    - Rule B: Plain Japanese names directly addressed to a person ("はやしさん", "田中", "@山田") also count as assignees — use the name as a string.
+    - Rule C: Fall back to thread context (most recent name mentioned) when current message has no name.
+    - Never use the bot as assignee.
+    - Only add "assignee" to missing_fields if NO assignee can be inferred from the message AND thread context.
   → Interpret relative dates (明日, 来週, 今週中) from JST time above; default time 10:00 JST
   → "前日にリマインド" → subtract one day from due_at
   → Ambiguous date → confidence < 0.6, add "due_at" to missing_fields
