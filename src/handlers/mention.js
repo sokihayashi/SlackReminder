@@ -649,39 +649,24 @@ async function runDiagnostics(channel, replyThreadTs, client) {
     return;
   }
 
-  // 2. public_channel list
-  let publicCount = null;
+  // 2. users.conversations (paginated) — primary listing of bot's member channels
+  let memberChannels = [];
+  let publicCount = 0;
+  let privateCount = 0;
   try {
-    const r = await client.conversations.list({ types: 'public_channel', exclude_archived: true, limit: 200 });
-    publicCount = (r.channels || []).filter(c => c.is_member).length;
-    lines.push(`✅ *channels:read* OK — bot がメンバーの public channel: *${publicCount} 個*`);
-  } catch (e) {
-    lines.push(`❌ *channels:read* 失敗 — ${scopeHintForError(e)}\n  → Slack アプリ設定で \`channels:read\` を追加して再インストール`);
-  }
-
-  // 3. private_channel list
-  let privateCount = null;
-  try {
-    const r = await client.conversations.list({ types: 'private_channel', exclude_archived: true, limit: 200 });
-    privateCount = (r.channels || []).filter(c => c.is_member).length;
-    lines.push(`✅ *groups:read* OK — bot がメンバーの private channel: *${privateCount} 個*`);
-  } catch (e) {
-    lines.push(`❌ *groups:read* 失敗 — ${scopeHintForError(e)}\n  → プライベートチャンネルを扱うなら \`groups:read\` を追加して再インストール`);
-  }
-
-  // 4. users.conversations (alternative listing — bot's own membership)
-  let userConvCount = null;
-  if (botUserId) {
-    try {
-      const r = await client.users.conversations({ user: botUserId, types: 'public_channel,private_channel', exclude_archived: true, limit: 200 });
-      userConvCount = (r.channels || []).length;
-      lines.push(`✅ *users.conversations* OK — \`${botUserId}\` 視点でのメンバー: *${userConvCount} 個*`);
-    } catch (e) {
-      lines.push(`⚠️ *users.conversations* 失敗 — ${scopeHintForError(e)}`);
+    memberChannels = await listBotMemberChannels(client);
+    publicCount = memberChannels.filter(c => !c.is_private).length;
+    privateCount = memberChannels.filter(c => c.is_private).length;
+    lines.push(`✅ *users.conversations* OK — bot がメンバーのチャンネル: *${memberChannels.length} 個* (public ${publicCount} / private ${privateCount})`);
+    if (memberChannels.length > 0) {
+      const sample = memberChannels.slice(0, 5).map(c => `#${c.name}`).join(', ');
+      lines.push(`  サンプル: ${sample}${memberChannels.length > 5 ? ` ほか${memberChannels.length - 5}件` : ''}`);
     }
+  } catch (e) {
+    lines.push(`❌ *users.conversations* 失敗 — ${scopeHintForError(e)}\n  → \`channels:read\` / \`groups:read\` を追加して再インストール`);
   }
 
-  // 5. history of current channel
+  // 3. history of current channel
   try {
     const r = await client.conversations.history({ channel, limit: 1 });
     lines.push(`✅ *このチャンネルの history* OK — 取得可能（${r.messages?.length ?? 0}件サンプル）`);
@@ -690,16 +675,15 @@ async function runDiagnostics(channel, replyThreadTs, client) {
     lines.push(`❌ *このチャンネルの history* 失敗 — ${hint}\n  → public なら \`channels:history\`、private なら \`groups:history\` を追加して再インストール`);
   }
 
-  // 6. summary
-  const total = (publicCount ?? 0) + (privateCount ?? 0);
+  // 4. summary
   lines.push('');
-  if (total === 0 && (userConvCount === null || userConvCount === 0)) {
+  if (memberChannels.length === 0) {
     lines.push(`⚠️ bot がメンバーになっているチャンネルが0件です。原因の可能性:`);
     lines.push(`  1. 後から追加した scope を反映するため *Reinstall to Workspace* が必要`);
     lines.push(`  2. bot を実際にチャンネルに招待していない`);
     lines.push(`  3. プライベートチャンネルのみで \`groups:read\` が未付与`);
   } else {
-    lines.push(`📊 合計: *${total} チャンネル* で動作可能`);
+    lines.push(`📊 合計: *${memberChannels.length} チャンネル* で動作可能`);
   }
 
   await client.chat.postMessage({
@@ -744,15 +728,35 @@ async function fetchChannelHistory(client, channel, beforeTs, limit = 100) {
   }
 }
 
-async function fetchAllChannelsHistory(client) {
-  const botPattern = botConfig.botUserId ? new RegExp(`<@${botConfig.botUserId}>`, 'g') : null;
-  try {
-    const list = await client.conversations.list({
+/**
+ * Paginated listing of channels the bot itself is a member of.
+ * Uses users.conversations (returns only bot's member channels — no client-side filtering needed)
+ * and walks all pages to avoid missing channels in large workspaces.
+ */
+async function listBotMemberChannels(client) {
+  const memberChannels = [];
+  if (!botConfig.botUserId) return memberChannels;
+  let cursor;
+  for (let i = 0; i < 20; i++) {
+    const r = await client.users.conversations({
+      user: botConfig.botUserId,
       types: 'public_channel,private_channel',
       exclude_archived: true,
       limit: 200,
+      cursor,
     });
-    const memberChannels = (list.channels || []).filter(c => c.is_member);
+    for (const c of (r.channels || [])) memberChannels.push(c);
+    cursor = r.response_metadata?.next_cursor;
+    if (!cursor) break;
+  }
+  return memberChannels;
+}
+
+async function fetchAllChannelsHistory(client) {
+  const botPattern = botConfig.botUserId ? new RegExp(`<@${botConfig.botUserId}>`, 'g') : null;
+  try {
+    const memberChannels = await listBotMemberChannels(client);
+    console.log(`[all-channels] bot is member of ${memberChannels.length} channels`);
 
     const perChannel = await Promise.all(memberChannels.map(async (ch) => {
       try {
