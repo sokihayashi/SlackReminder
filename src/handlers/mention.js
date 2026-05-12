@@ -396,13 +396,13 @@ async function handleExtractFromAllChannels(originChannel, replyThreadTs, curren
 
   const perChannel = await Promise.all(channels.map(async (ch) => {
     try {
-      const tasks = await extractTasksFromThread(ch.messages, new Date(), botConfig.botUserId);
-      const filtered = tasks.filter(t => t.confidence >= 0.35);
-      console.log(`[all-channels] #${ch.channelName}: AI ${tasks.length} tasks → ${filtered.length} pass confidence>=0.35`);
-      return { ...ch, tasks: filtered };
+      const allTasks = await extractTasksFromThread(ch.messages, new Date(), botConfig.botUserId);
+      const tasks = allTasks.filter(t => t.confidence >= 0.35);
+      console.log(`[all-channels] #${ch.channelName}: AI ${allTasks.length} tasks → ${tasks.length} pass confidence>=0.35`);
+      return { ...ch, allTasks, tasks };
     } catch (e) {
       console.error(`[all-channels] extract failed for #${ch.channelName}:`, e.message);
-      return { ...ch, tasks: [] };
+      return { ...ch, allTasks: [], tasks: [], error: e.message };
     }
   }));
 
@@ -417,9 +417,25 @@ async function handleExtractFromAllChannels(originChannel, replyThreadTs, curren
   }
 
   if (allResults.length === 0) {
+    const diag = perChannel.map(ch => {
+      let status;
+      if (ch.error) status = `❌ ${ch.error}`;
+      else if (ch.allTasks.length === 0) status = 'AI抽出: 0件';
+      else if (ch.tasks.length === 0) status = `AI抽出: ${ch.allTasks.length}件 (全て信頼度<0.35)`;
+      else status = `AI抽出: ${ch.tasks.length}件 (担当者特定失敗)`;
+
+      const sample = ch.allTasks.slice(0, 3).map(t => {
+        const conf = (t.confidence ?? 0).toFixed(2);
+        const assignee = t.assignee || '(担当不明)';
+        return `　　• "${t.task}" 担当=${assignee} conf=${conf}`;
+      }).join('\n');
+
+      return `  *#${ch.channelName}* (${ch.messages.length}件のメッセージ) — ${status}${sample ? '\n' + sample : ''}`;
+    }).join('\n');
+
     await client.chat.postMessage({
       channel: originChannel, thread_ts: replyThreadTs,
-      text: `🔍 ${channels.length} チャンネルをスキャンしましたが、タスクは見つかりませんでした。`,
+      text: `🔍 ${channels.length} チャンネルをスキャンしましたが、登録できるタスクはありませんでした。\n\n*診断:*\n${diag}\n\n_メッセージは取得できているが AI がタスクとして拾えていないなら、メッセージの書き方に対する AI プロンプトの調整が必要です。_`,
     });
     return;
   }
@@ -671,7 +687,7 @@ async function runDiagnostics(channel, replyThreadTs, client) {
   // 3. history of current channel
   try {
     const r = await client.conversations.history({ channel, limit: 1 });
-    lines.push(`✅ *このチャンネルの history* OK — 取得可能（${r.messages?.length ?? 0}件サンプル）`);
+    lines.push(`✅ *このチャンネルの history* OK — 取得可能(${r.messages?.length ?? 0}件サンプル)`);
   } catch (e) {
     const hint = scopeHintForError(e);
     lines.push(`❌ *このチャンネルの history* 失敗 — ${hint}\n  → public なら \`channels:history\`、private なら \`groups:history\` を追加して再インストール`);
