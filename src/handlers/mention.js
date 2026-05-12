@@ -4,7 +4,7 @@ const {
   getAllPending, getPendingByAssignee, cancelReminder, approveReminder,
   getSetting, setSetting, getAllSettings,
   savePendingQuestion, deletePendingQuestion, findByThreadTs,
-  findAllByConfirmationTs,
+  findAllByConfirmationTs, getAllReminders, wipeAll,
 } = require('../db');
 const { formatDueAt, formatHours, computeAdvanceNoticeHours, displayAssignee, silentAssigneeDisplay, silentDisplayAssignee, getDisplayName, CONFIDENCE_THRESHOLD, DEFAULT_ADVANCE_NOTICE_HOURS } = require('../utils');
 const botConfig = require('../botConfig');
@@ -25,6 +25,11 @@ async function handleMention({ event, client, priorText = null, silentOnNone = f
       }
       if (/^(診断|debug|diagnos[ei]s|scope確認|セルフチェック)\??$/i.test(bare)) {
         await runDiagnostics(channel, replyThreadTs, client);
+        return;
+      }
+      const resetMatch = bare.match(/^RESET\s+(\S+)\s*$/i);
+      if (resetMatch) {
+        await handleReset(channel, replyThreadTs, client, resetMatch[1]);
         return;
       }
     }
@@ -48,7 +53,8 @@ async function handleMention({ event, client, priorText = null, silentOnNone = f
       case 'show_settings':         return handleShowSettings(channel, replyThreadTs, client);
       case 'extract_from_thread':
         if (extraction.channel_scope === 'all') {
-          return handleExtractFromAllChannels(channel, replyThreadTs, ts, user, client);
+          const fullHistory = /全期間|過去全部|過去全て|all\s*time/i.test(cleanText);
+          return handleExtractFromAllChannels(channel, replyThreadTs, ts, user, client, { fullHistory });
         }
         return handleExtractFromThread(channel, thread_ts, replyThreadTs, ts, user, client);
     }
@@ -541,17 +547,19 @@ async function handleExtractFromThread(channel, threadTs, replyThreadTs, current
   });
 }
 
-async function handleExtractFromAllChannels(originChannel, replyThreadTs, currentTs, user, client) {
+async function handleExtractFromAllChannels(originChannel, replyThreadTs, currentTs, user, client, { fullHistory = false } = {}) {
+  const oldest = fullHistory ? undefined : Math.floor((Date.now() - 7 * 24 * 3600 * 1000) / 1000).toString();
+  const rangeLabel = fullHistory ? '全期間' : '直近1週間';
   await client.chat.postMessage({
     channel: originChannel, thread_ts: replyThreadTs,
-    text: '🔍 入っている全チャンネルをスキャン中…（チャンネル数によっては数十秒かかります）',
+    text: `🔍 ${rangeLabel}で全チャンネルをスキャン中…（チャンネル数によっては数十秒かかります）`,
   });
 
-  const channels = await fetchAllChannelsHistory(client);
+  const channels = await fetchAllChannelsHistory(client, oldest);
   if (channels.length === 0) {
     await client.chat.postMessage({
       channel: originChannel, thread_ts: replyThreadTs,
-      text: 'スキャン対象のチャンネルが見つかりませんでした。`@Reminder Bot 診断` でスコープ／メンバー状態を確認してください。',
+      text: `スキャン対象のチャンネルが見つかりませんでした（${rangeLabel}）。\`@Reminder Bot 診断\` でメンバー状態を確認してください。`,
     });
     return;
   }
@@ -568,29 +576,40 @@ async function handleExtractFromAllChannels(originChannel, replyThreadTs, curren
     }
   }));
 
-  const allResults = [];
-  const registerResults = new Map();
+  // Dedup: classify each extracted task as "new" or "already-pending"
+  // by comparing against active reminders in the same channel.
+  const allPending = getAllPending();
+  const newDrafts = [];           // { channelName, taskData, draftResult }
+  const existingMatches = [];     // { channelName, taskData, existingReminder }
+
   for (const ch of perChannel) {
-    const r = await bulkCreateReminders(ch.tasks, {
+    const newTasksHere = [];
+    for (const t of ch.tasks) {
+      const existing = findExistingReminder(allPending, ch.channelId, t);
+      if (existing) {
+        existingMatches.push({ channelName: ch.channelName, taskData: t, existingReminder: existing });
+      } else {
+        newTasksHere.push(t);
+      }
+    }
+    if (newTasksHere.length === 0) continue;
+
+    const r = await bulkCreateReminders(newTasksHere, {
       channelId: originChannel, messageTs: currentTs, threadTs: replyThreadTs, user, notificationTarget: 'dm',
-    }, client);
-    registerResults.set(ch.channelName, r);
+    }, client, { approve: false });
     for (const item of r.filter(x => x.status === 'created')) {
-      allResults.push({ channelName: ch.channelName, ...item });
+      newDrafts.push({ channelName: ch.channelName, ...item });
     }
   }
 
-  if (allResults.length === 0) {
+  // Nothing extracted at all → diagnostic message
+  if (newDrafts.length === 0 && existingMatches.length === 0) {
     const diag = perChannel.map(ch => {
       let status;
       if (ch.error) status = `❌ ${ch.error}`;
       else if (ch.allTasks.length === 0) status = 'AI抽出: 0件';
       else if (ch.tasks.length === 0) status = `AI抽出: ${ch.allTasks.length}件 (全て信頼度<0.35)`;
-      else {
-        const errs = (registerResults.get(ch.channelName) || []).filter(x => x.status === 'error');
-        const firstErr = errs[0]?.errorMessage || '不明';
-        status = `AI抽出: ${ch.tasks.length}件 / 登録失敗: ${errs.length}件 (例: ${firstErr})`;
-      }
+      else status = `AI抽出: ${ch.tasks.length}件`;
 
       const sample = ch.allTasks.slice(0, 3).map(t => {
         const conf = (t.confidence ?? 0).toFixed(2);
@@ -598,35 +617,126 @@ async function handleExtractFromAllChannels(originChannel, replyThreadTs, curren
         return `　　• "${t.task}" 担当=${assignee} conf=${conf}`;
       }).join('\n');
 
-      return `  *#${ch.channelName}* (${ch.messages.length}件のメッセージ) — ${status}${sample ? '\n' + sample : ''}`;
+      return `  *#${ch.channelName}* (${ch.messages.length}件) — ${status}${sample ? '\n' + sample : ''}`;
     }).join('\n');
 
     await client.chat.postMessage({
       channel: originChannel, thread_ts: replyThreadTs,
-      text: `🔍 ${channels.length} チャンネルをスキャンしましたが、登録できるタスクはありませんでした。\n\n*診断:*\n${diag}\n\n_メッセージは取得できているが AI がタスクとして拾えていないなら、メッセージの書き方に対する AI プロンプトの調整が必要です。_`,
+      text: `🔍 ${rangeLabel}・${channels.length} チャンネルからタスク候補は見つかりませんでした。\n\n*診断:*\n${diag}`,
     });
     return;
   }
 
-  const byChannel = new Map();
-  for (const r of allResults) {
-    if (!byChannel.has(r.channelName)) byChannel.set(r.channelName, []);
-    byChannel.get(r.channelName).push(r);
-  }
+  // Build extraction review message (draft mode — no auto-register).
+  const MAX_NEW_DISPLAY = 15;
+  const displayedNew = newDrafts.slice(0, MAX_NEW_DISPLAY);
+  const newOverflow = newDrafts.length - displayedNew.length;
 
-  const sections = [];
-  for (const [chName, items] of byChannel) {
-    const lines = items.map((r, i) => {
-      const dueNote = r.hasDefaultDue ? '　_※期限未指定のため1週間後_' : '';
-      return `　${i + 1}. ✅ *${r.task}*\n　　　担当: ${r.assigneeDisplay}　期限: ${formatDueAt(r.dueAt)}${dueNote}`;
-    });
-    sections.push(`*#${chName}*\n${lines.join('\n')}`);
-  }
+  const entries = displayedNew.map((r, i) => ({
+    id: r.id,
+    index: i + 1,
+    task: `${r.task}　_〔#${r.channelName}〕_`,
+    assigneeDisplay: r.assigneeDisplay,
+    dueAt: r.dueAt,
+    hasDefaultDue: r.hasDefaultDue,
+    advanceNoticeHours: r.advanceNoticeHours,
+    _status: 'draft',
+  }));
 
-  await client.chat.postMessage({
-    channel: originChannel, thread_ts: replyThreadTs,
-    text: `📋 ${channels.length} チャンネルから *${allResults.length} 件* のリマインドを登録しました。\n\n${sections.join('\n\n')}\n\n_キャンセルは「@Reminder Bot ○○のリマインドキャンセル」_`,
+  const blocks = [];
+  blocks.push({
+    type: 'section',
+    text: { type: 'mrkdwn', text: `🔍 *${rangeLabel}・${channels.length} チャンネル抽出結果*\n\n*新規候補*: ${newDrafts.length}件　／　*既存リマインドあり*: ${existingMatches.length}件\n\n_棚卸し用です。新規候補から確定したいものだけボタンで選んでください。_` },
   });
+
+  if (entries.length > 0) {
+    blocks.push({ type: 'divider' });
+    blocks.push({ type: 'header', text: { type: 'plain_text', text: `📝 新規候補 (${newDrafts.length}件)` } });
+    const draftBlocks = bulkConfirmBlocks(entries);
+    // Skip the first section in bulkConfirmBlocks (intro line) since we already added header.
+    blocks.push(...draftBlocks.slice(1));
+  }
+
+  if (existingMatches.length > 0) {
+    blocks.push({ type: 'divider' });
+    blocks.push({ type: 'header', text: { type: 'plain_text', text: `🔔 既存リマインドあり (${existingMatches.length}件)` } });
+    for (const m of existingMatches.slice(0, 10)) {
+      const assignee = await silentAssigneeDisplay(client, m.existingReminder.assignee_slack_user_id, m.existingReminder.assignee_name);
+      blocks.push({
+        type: 'section',
+        text: { type: 'mrkdwn', text: `• *${m.taskData.task}*　_〔#${m.channelName}〕_\n　 ↳ 登録済み: 担当 ${assignee}　期限 ${formatDueAt(m.existingReminder.due_at)}` },
+      });
+    }
+    if (existingMatches.length > 10) {
+      blocks.push({
+        type: 'context',
+        elements: [{ type: 'mrkdwn', text: `_他に${existingMatches.length - 10}件の既存マッチあり。_` }],
+      });
+    }
+  }
+
+  if (newOverflow > 0) {
+    blocks.push({
+      type: 'context',
+      elements: [{ type: 'mrkdwn', text: `_新規候補は${newDrafts.length}件あるが、最初の${MAX_NEW_DISPLAY}件のみ表示。「全件確定」で全部登録できます。範囲を狭めて再実行するなら直近指定を変えてください。_` }],
+    });
+  }
+
+  blocks.push({
+    type: 'context',
+    elements: [{ type: 'mrkdwn', text: `_全期間で再実行するなら: @Reminder Bot 全期間で全チャンネルからタスク抽出_` }],
+  });
+
+  const confirmMsg = await client.chat.postMessage({
+    channel: originChannel, thread_ts: replyThreadTs,
+    text: `🔍 ${rangeLabel}・${channels.length}チャンネル抽出 — 新規${newDrafts.length}件 / 既存${existingMatches.length}件`,
+    blocks,
+  });
+
+  // Tag all drafts (including non-displayed overflow) with the confirmation msg ts
+  // so 全件確定 catches them all and refreshBulkMessage can resolve them.
+  for (const r of newDrafts) setConfirmationTs(r.id, confirmMsg.ts);
+}
+
+/**
+ * Heuristic dedup: is there an active (draft/pending) reminder in `pendingList`
+ * that already covers the task being extracted?
+ *
+ * Match criteria:
+ * - Same source_channel_id
+ * - Same assignee (Slack ID OR name overlap)
+ * - Task text overlap (case-insensitive substring or significant prefix)
+ */
+function findExistingReminder(pendingList, channelId, taskData) {
+  const newAssigneeId = extractUserId(taskData.assignee || '');
+  const newAssigneeName = taskData.assignee || '';
+
+  return pendingList.find(r => {
+    if (r.source_channel_id !== channelId) return false;
+    if (!['draft', 'pending'].includes(r.status)) return false;
+
+    const assigneeMatch =
+      (newAssigneeId && r.assignee_slack_user_id === newAssigneeId) ||
+      (!newAssigneeId && newAssigneeName && (
+        (r.assignee_name || '').includes(newAssigneeName) ||
+        newAssigneeName.includes(r.assignee_name || '')
+      ));
+    if (!assigneeMatch) return false;
+
+    return isTaskSimilar(r.task, taskData.task);
+  });
+}
+
+function isTaskSimilar(a, b) {
+  if (!a || !b) return false;
+  const norm = (s) => s.toLowerCase().replace(/\s+/g, '');
+  const na = norm(a), nb = norm(b);
+  if (na === nb) return true;
+  // Containment
+  if (na.length >= 6 && (na.includes(nb) || nb.includes(na))) return true;
+  // First 8 normalized chars match
+  if (na.length >= 8 && nb.length >= 8 && na.slice(0, 8) === nb.slice(0, 8)) return true;
+  return false;
 }
 
 async function handleUpdateSetting(extraction, channel, replyThreadTs, client) {
@@ -823,6 +933,87 @@ async function postHelp(channel, replyThreadTs, client) {
   });
 }
 
+// ── Admin RESET ─────────────────────────────────────────────────────────────────
+
+async function handleReset(channel, replyThreadTs, client, code) {
+  const expected = process.env.ADMIN_RESET_CODE;
+  if (!expected) {
+    await client.chat.postMessage({
+      channel, thread_ts: replyThreadTs,
+      text: '⚠️ ADMIN_RESET_CODE が GitHub Secrets に設定されていません。',
+    });
+    return;
+  }
+  if (code !== expected) {
+    await client.chat.postMessage({
+      channel, thread_ts: replyThreadTs,
+      text: '❌ RESET コードが一致しません。',
+    });
+    return;
+  }
+  const count = getAllReminders().length;
+  await client.chat.postMessage({
+    channel, thread_ts: replyThreadTs,
+    text: '⚠️ RESET 確認',
+    blocks: [
+      {
+        type: 'section',
+        text: { type: 'mrkdwn', text: `⚠️ *RESET 確認*\n\n以下を全削除します（**元に戻せません**）:\n• DB のリマインド: *${count} 件*\n• \`pending_questions\` テーブル\n• bot がメンバーチャンネルに投稿した直近メッセージ（チャンネルあたり最新100件）\n\n_設定（事前通知時刻、サマリーチャンネル）は保持されます。_` },
+      },
+      {
+        type: 'actions',
+        elements: [
+          { type: 'button', text: { type: 'plain_text', text: '🗑️ 実行' }, value: 'do', action_id: 'reset_confirm', style: 'danger' },
+          { type: 'button', text: { type: 'plain_text', text: '中止' }, value: 'no', action_id: 'reset_cancel' },
+        ],
+      },
+    ],
+  });
+}
+
+async function executeReset(client, channel, ts) {
+  try {
+    await client.chat.update({ channel, ts, text: '🗑️ RESET 実行中… (Slack メッセージ削除に時間がかかる場合があります)' });
+  } catch (_) {}
+
+  let slackDeleted = 0;
+  let errors = 0;
+
+  // 1. Walk bot's member channels and delete bot's recent messages.
+  if (botConfig.botUserId) {
+    try {
+      const channels = await listBotMemberChannels(client);
+      for (const ch of channels) {
+        try {
+          const history = await client.conversations.history({ channel: ch.id, limit: 100 });
+          for (const m of (history.messages || [])) {
+            if (m.user === botConfig.botUserId) {
+              try {
+                await client.chat.delete({ channel: ch.id, ts: m.ts });
+                slackDeleted++;
+              } catch (e) {
+                errors++;
+              }
+            }
+          }
+        } catch (e) {
+          console.error(`[reset] history failed for ${ch.id}:`, e.message);
+        }
+      }
+    } catch (e) {
+      console.error('[reset] listBotMemberChannels failed:', e.message);
+    }
+  }
+
+  // 2. Wipe DB.
+  const wiped = wipeAll();
+
+  await client.chat.postMessage({
+    channel,
+    text: `✅ RESET 完了。DB ${wiped.reminders}件 / Slack ${slackDeleted}件 削除しました。${errors > 0 ? ` (削除エラー: ${errors}件)` : ''}`,
+  });
+}
+
 // ── Diagnostics ─────────────────────────────────────────────────────────────────
 
 /**
@@ -959,15 +1150,17 @@ async function listBotMemberChannels(client) {
   return memberChannels;
 }
 
-async function fetchAllChannelsHistory(client) {
+async function fetchAllChannelsHistory(client, oldest) {
   const botPattern = botConfig.botUserId ? new RegExp(`<@${botConfig.botUserId}>`, 'g') : null;
   try {
     const memberChannels = await listBotMemberChannels(client);
-    console.log(`[all-channels] bot is member of ${memberChannels.length} channels`);
+    console.log(`[all-channels] bot is member of ${memberChannels.length} channels${oldest ? ` (oldest=${oldest})` : ''}`);
 
     const perChannel = await Promise.all(memberChannels.map(async (ch) => {
       try {
-        const r = await client.conversations.history({ channel: ch.id, limit: 100 });
+        const params = { channel: ch.id, limit: 100 };
+        if (oldest) params.oldest = oldest;
+        const r = await client.conversations.history(params);
         const messages = (r.messages || [])
           .filter(m => m.user && m.user !== botConfig.botUserId && m.text)
           .reverse()
@@ -1105,4 +1298,4 @@ async function handleBotJoinedChannel({ event, client }) {
   });
 }
 
-module.exports = { handleMention, notificationTargetBlock, handlePassiveDetection, handleBotJoinedChannel, bulkConfirmBlocks, refreshBulkMessage };
+module.exports = { handleMention, notificationTargetBlock, handlePassiveDetection, handleBotJoinedChannel, bulkConfirmBlocks, refreshBulkMessage, executeReset };
