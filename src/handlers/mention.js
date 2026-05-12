@@ -397,7 +397,9 @@ async function handleExtractFromAllChannels(originChannel, replyThreadTs, curren
   const perChannel = await Promise.all(channels.map(async (ch) => {
     try {
       const tasks = await extractTasksFromThread(ch.messages, new Date(), botConfig.botUserId);
-      return { ...ch, tasks: tasks.filter(t => t.confidence >= 0.5) };
+      const filtered = tasks.filter(t => t.confidence >= 0.35);
+      console.log(`[all-channels] #${ch.channelName}: AI ${tasks.length} tasks → ${filtered.length} pass confidence>=0.35`);
+      return { ...ch, tasks: filtered };
     } catch (e) {
       console.error(`[all-channels] extract failed for #${ch.channelName}:`, e.message);
       return { ...ch, tasks: [] };
@@ -716,7 +718,7 @@ async function fetchChannelHistory(client, channel, beforeTs, limit = 100) {
   try {
     const result = await client.conversations.history({ channel, latest: beforeTs, limit, inclusive: false });
     return (result.messages || [])
-      .filter(m => m.user && m.user !== botConfig.botUserId && m.text && !m.thread_ts)
+      .filter(m => m.user && m.user !== botConfig.botUserId && m.text)
       .reverse()
       .map(m => {
         const txt = botPattern ? m.text.replace(botPattern, '').trim() : m.text;
@@ -762,12 +764,13 @@ async function fetchAllChannelsHistory(client) {
       try {
         const r = await client.conversations.history({ channel: ch.id, limit: 100 });
         const messages = (r.messages || [])
-          .filter(m => m.user && m.user !== botConfig.botUserId && m.text && !m.thread_ts)
+          .filter(m => m.user && m.user !== botConfig.botUserId && m.text)
           .reverse()
           .map(m => {
             const txt = botPattern ? m.text.replace(botPattern, '').trim() : m.text;
             return { user: m.user, text: txt.slice(0, 500) };
           });
+        console.log(`[all-channels] #${ch.name}: ${r.messages?.length ?? 0} raw → ${messages.length} user msgs`);
         return { channelId: ch.id, channelName: ch.name, messages };
       } catch (e) {
         console.error(`[all-channels] history failed for #${ch.name}:`, e.message);
