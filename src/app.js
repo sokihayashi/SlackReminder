@@ -2,7 +2,8 @@ require('dotenv').config();
 
 const { App, LogLevel } = require('@slack/bolt');
 const botConfig = require('./botConfig');
-const { handleMention, notificationTargetBlock, handlePassiveDetection, handleBotJoinedChannel, bulkConfirmBlocks, refreshBulkMessage, executeReset } = require('./handlers/mention');
+const { handleMention, notificationTargetBlock, handlePassiveDetection, handleBotJoinedChannel, bulkConfirmBlocks, refreshBulkMessage } = require('./handlers/mention');
+const { executeReset } = require('./handlers/admin');
 const { handleReaction } = require('./handlers/reaction');
 const { startScheduler } = require('./scheduler');
 
