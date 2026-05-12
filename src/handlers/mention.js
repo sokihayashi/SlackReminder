@@ -5,7 +5,7 @@ const {
   getSetting, setSetting, getAllSettings,
   savePendingQuestion, deletePendingQuestion, findByThreadTs,
 } = require('../db');
-const { formatDueAt, formatHours, displayAssignee, silentAssigneeDisplay, silentDisplayAssignee, getDisplayName, CONFIDENCE_THRESHOLD, DEFAULT_ADVANCE_NOTICE_HOURS } = require('../utils');
+const { formatDueAt, formatHours, computeAdvanceNoticeHours, displayAssignee, silentAssigneeDisplay, silentDisplayAssignee, getDisplayName, CONFIDENCE_THRESHOLD, DEFAULT_ADVANCE_NOTICE_HOURS } = require('../utils');
 const botConfig = require('../botConfig');
 
 async function handleMention({ event, client, priorText = null, silentOnNone = false }) {
@@ -227,7 +227,7 @@ function defaultDueAtJST(daysFromNow = 7) {
   return `${y}-${mo}-${da}T10:00:00+09:00`;
 }
 
-async function bulkCreateReminders(tasks, source, client) {
+async function bulkCreateReminders(tasks, source, client, { approve = true } = {}) {
   const fallbackDue = defaultDueAtJST(7);
   const messageTs = source.messageTs || '';
   const threadTs = source.threadTs || '';
@@ -240,6 +240,7 @@ async function bulkCreateReminders(tasks, source, client) {
     }
     const dueAt = t.due_at || fallbackDue;
     const hasDefaultDue = !t.due_at;
+    const advanceNoticeHours = t.advance_notice_hours ?? computeAdvanceNoticeHours(dueAt);
     try {
       const id = createReminder({
         task: t.task,
@@ -251,12 +252,12 @@ async function bulkCreateReminders(tasks, source, client) {
         sourceThreadTs: threadTs,
         createdBy: source.user,
         confidence: t.confidence ?? 1,
-        advanceNoticeHours: t.advance_notice_hours ?? null,
+        advanceNoticeHours,
         notificationTarget: source.notificationTarget || 'dm',
       });
-      approveReminder(id);
+      if (approve) approveReminder(id);
       const assigneeDisplay = await silentAssigneeDisplay(client, assigneeSlackUserId, assigneeName);
-      results.push({ task: t.task, assigneeDisplay, dueAt, hasDefaultDue, status: 'created' });
+      results.push({ id, task: t.task, assigneeDisplay, dueAt, hasDefaultDue, advanceNoticeHours, status: 'created' });
     } catch (err) {
       console.error('[bulk] createReminder error:', err.message);
       results.push({ task: t.task, status: 'error', errorMessage: err.message });
@@ -328,9 +329,10 @@ async function postSingleConfirmation(t, notifTarget, channel, ts, replyThreadTs
 }
 
 async function postBulkCreate(tasks, notifTarget, channel, ts, replyThreadTs, user, client) {
+  // Draft mode: don't approve immediately, require user to confirm via buttons.
   const results = await bulkCreateReminders(tasks, {
     channelId: channel, messageTs: ts, threadTs: replyThreadTs, user, notificationTarget: notifTarget,
-  }, client);
+  }, client, { approve: false });
 
   const created = results.filter(r => r.status === 'created');
   if (created.length === 0) {
@@ -338,11 +340,109 @@ async function postBulkCreate(tasks, notifTarget, channel, ts, replyThreadTs, us
     return;
   }
 
-  await client.chat.postMessage({
+  const blocks = bulkConfirmBlocks(created.map((r, i) => ({ ...r, index: i + 1, _status: 'draft' })));
+  const headerText = `📋 ${created.length} 件のリマインド候補を作成しました。確定 / キャンセルしてください。`;
+
+  const confirmMsg = await client.chat.postMessage({
     channel,
     thread_ts: replyThreadTs,
-    text: `📋 *${created.length} 件* のリマインドに分解して登録しました。\n\n${formatBulkLines(results).join('\n\n')}\n\n_修正はスレッド返信、キャンセルは「@Reminder Bot ○○のリマインドキャンセル」_`,
+    text: headerText,
+    blocks,
   });
+
+  // Track which message hosts these drafts so action handlers can find them.
+  for (const r of created) setConfirmationTs(r.id, confirmMsg.ts);
+}
+
+/**
+ * Build the Block Kit message for bulk-draft confirmation.
+ * Each reminder gets a section + per-row ✅/❌ buttons.
+ * Footer has 全件確定 / 全件キャンセル.
+ *
+ * Each entry must include: { id, index, task, assigneeDisplay, dueAt, advanceNoticeHours, hasDefaultDue, _status }
+ *   _status: 'draft' | 'pending' (approved) | 'cancelled'
+ */
+function bulkConfirmBlocks(entries) {
+  const blocks = [];
+  const draftCount = entries.filter(e => e._status === 'draft').length;
+
+  blocks.push({
+    type: 'section',
+    text: {
+      type: 'mrkdwn',
+      text: draftCount > 0
+        ? `📋 *${entries.length} 件* のリマインド候補。下記から個別に確定 / キャンセル、または末尾で一括操作してください。`
+        : `📋 *${entries.length} 件* のリマインドを処理しました。`,
+    },
+  });
+
+  for (const e of entries) {
+    const dueNote = e.hasDefaultDue ? '　_※期限未指定のため1週間後_' : '';
+    const noticeLabel = e.advanceNoticeHours ? `事前通知: ${formatHours(e.advanceNoticeHours)}前` : '';
+    const statusBadge = e._status === 'pending' ? ' ✅ *確定済み*'
+      : e._status === 'cancelled' ? ' ❌ *キャンセル済み*'
+      : '';
+    blocks.push({ type: 'divider' });
+    blocks.push({
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: `*${e.index}. ${e.task}*${statusBadge}\n担当: ${e.assigneeDisplay}　期限: ${formatDueAt(e.dueAt)}${dueNote}${noticeLabel ? `\n_${noticeLabel}_` : ''}`,
+      },
+    });
+    if (e._status === 'draft') {
+      blocks.push({
+        type: 'actions',
+        elements: [
+          {
+            type: 'button',
+            text: { type: 'plain_text', text: `✅ ⌗${e.index} 確定` },
+            value: e.id,
+            action_id: 'bulk_approve_one',
+            style: 'primary',
+          },
+          {
+            type: 'button',
+            text: { type: 'plain_text', text: `❌ ⌗${e.index} 取消` },
+            value: e.id,
+            action_id: 'bulk_cancel_one',
+          },
+        ],
+      });
+    }
+  }
+
+  blocks.push({ type: 'divider' });
+
+  if (draftCount > 0) {
+    const draftIds = entries.filter(e => e._status === 'draft').map(e => e.id);
+    blocks.push({
+      type: 'actions',
+      elements: [
+        {
+          type: 'button',
+          text: { type: 'plain_text', text: `✅ 全件確定 (${draftCount})` },
+          value: JSON.stringify(draftIds),
+          action_id: 'bulk_approve_all',
+          style: 'primary',
+        },
+        {
+          type: 'button',
+          text: { type: 'plain_text', text: `❌ 全件キャンセル` },
+          value: JSON.stringify(draftIds),
+          action_id: 'bulk_cancel_all',
+          style: 'danger',
+        },
+      ],
+    });
+  }
+
+  blocks.push({
+    type: 'context',
+    elements: [{ type: 'mrkdwn', text: '_個別修正はスレッドに「⌗1 の期限を 明日 17時 に」のように番号付きで返信_' }],
+  });
+
+  return blocks;
 }
 
 async function handleExtractFromThread(channel, threadTs, replyThreadTs, currentTs, user, client) {
@@ -930,4 +1030,4 @@ async function handleBotJoinedChannel({ event, client }) {
   });
 }
 
-module.exports = { handleMention, notificationTargetBlock, handlePassiveDetection, handleBotJoinedChannel };
+module.exports = { handleMention, notificationTargetBlock, handlePassiveDetection, handleBotJoinedChannel, bulkConfirmBlocks };
