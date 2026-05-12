@@ -1054,44 +1054,159 @@ async function executeReset(client, channel, ts) {
     await client.chat.update({ channel, ts, text: '🗑️ RESET 実行中… (Slack メッセージ削除に時間がかかります)' });
   } catch (_) {}
 
-  let slackDeleted = 0;
-  let errors = 0;
+  const phases = {
+    channels: { scanned: 0, deleted: 0, errors: 0, firstErr: null, fail: null },
+    ims: { scanned: 0, deleted: 0, errors: 0, firstErr: null, fail: null },
+    imsByAssignee: { scanned: 0, deleted: 0, errors: 0, firstErr: null, fail: null },
+  };
+
+  // Collect known DM partners from reminders BEFORE we wipe the DB
+  const knownAssigneeUserIds = new Set();
+  try {
+    for (const r of getAllReminders()) {
+      if (r.assignee_slack_user_id) knownAssigneeUserIds.add(r.assignee_slack_user_id);
+      if (r.created_by) knownAssigneeUserIds.add(r.created_by);
+    }
+  } catch (e) {
+    console.error('[reset] getAllReminders failed:', e.message);
+  }
+
+  // Instrument deleteBotMessagesInConversation to bubble up first error message
+  const purge = async (id, phaseKey) => {
+    const phase = phases[phaseKey];
+    try {
+      const r = await deleteBotMessagesInConversationVerbose(client, id, 5);
+      phase.deleted += r.deleted;
+      phase.errors += r.errors;
+      if (!phase.firstErr && r.firstErr) phase.firstErr = r.firstErr;
+    } catch (e) {
+      phase.errors++;
+      if (!phase.firstErr) phase.firstErr = e?.data?.error || e.message;
+    }
+  };
 
   if (botConfig.botUserId) {
     // 1. Member channels (public + private the bot is in)
     try {
       const channels = await listBotMemberChannels(client);
+      phases.channels.scanned = channels.length;
       console.log(`[reset] purging ${channels.length} member channels`);
-      for (const ch of channels) {
-        const r = await deleteBotMessagesInConversation(client, ch.id, 5);
-        slackDeleted += r.deleted;
-        errors += r.errors;
-      }
+      for (const ch of channels) await purge(ch.id, 'channels');
     } catch (e) {
+      phases.channels.fail = e?.data?.error || e.message;
       console.error('[reset] member channel sweep failed:', e.message);
     }
 
-    // 2. IM conversations (DMs) — reminder notifications, follow-up messages
+    // 2. IM conversations via conversations.list (requires im:read)
     try {
       const ims = await listAllIMConversations(client);
-      console.log(`[reset] purging ${ims.length} IM conversations`);
-      for (const im of ims) {
-        const r = await deleteBotMessagesInConversation(client, im.id, 5);
-        slackDeleted += r.deleted;
-        errors += r.errors;
-      }
+      phases.ims.scanned = ims.length;
+      console.log(`[reset] purging ${ims.length} IM conversations via conversations.list`);
+      for (const im of ims) await purge(im.id, 'ims');
     } catch (e) {
+      phases.ims.fail = e?.data?.error || e.message;
       console.error('[reset] IM sweep failed:', e.message);
+    }
+
+    // 3. Fallback: open DM per known assignee (works without im:read)
+    //    Skip IDs we already covered via conversations.list.
+    const alreadyCovered = new Set();
+    try {
+      const listed = await listAllIMConversations(client);
+      for (const im of listed) if (im.user) alreadyCovered.add(im.user);
+    } catch (_) {}
+
+    for (const userId of knownAssigneeUserIds) {
+      if (userId === botConfig.botUserId) continue;
+      if (alreadyCovered.has(userId)) continue;
+      try {
+        const open = await client.conversations.open({ users: userId });
+        const dmId = open?.channel?.id;
+        if (!dmId) continue;
+        phases.imsByAssignee.scanned++;
+        await purge(dmId, 'imsByAssignee');
+      } catch (e) {
+        phases.imsByAssignee.errors++;
+        if (!phases.imsByAssignee.firstErr) phases.imsByAssignee.firstErr = e?.data?.error || e.message;
+      }
     }
   }
 
-  // 3. Wipe DB
+  // 4. Wipe DB
   const wiped = wipeAll();
 
-  await client.chat.postMessage({
-    channel,
-    text: `✅ RESET 完了。\n• DB: リマインド ${wiped.reminders}件 / pending ${wiped.pending}件 削除\n• Slack: ${slackDeleted}件削除${errors > 0 ? `（削除エラー: ${errors}件 — 過去メッセージは 24h 経過しているなどで削除不能の場合あり）` : ''}`,
-  });
+  const totalDeleted = phases.channels.deleted + phases.ims.deleted + phases.imsByAssignee.deleted;
+  const totalErrors = phases.channels.errors + phases.ims.errors + phases.imsByAssignee.errors;
+
+  const lines = [
+    `✅ RESET 完了。`,
+    `• DB: リマインド ${wiped.reminders}件 / pending ${wiped.pending}件 削除`,
+    `• チャンネル: ${phases.channels.scanned}個 scan / ${phases.channels.deleted}件削除 / ${phases.channels.errors}エラー${phases.channels.fail ? ` (列挙失敗: \`${phases.channels.fail}\`)` : ''}${phases.channels.firstErr ? ` (例: \`${phases.channels.firstErr}\`)` : ''}`,
+    `• DM (im list): ${phases.ims.scanned}個 scan / ${phases.ims.deleted}件削除 / ${phases.ims.errors}エラー${phases.ims.fail ? ` (列挙失敗: \`${phases.ims.fail}\` — \`im:read\` 不足の可能性)` : ''}${phases.ims.firstErr ? ` (例: \`${phases.ims.firstErr}\`)` : ''}`,
+    `• DM (assignee fallback): ${phases.imsByAssignee.scanned}個 scan / ${phases.imsByAssignee.deleted}件削除 / ${phases.imsByAssignee.errors}エラー${phases.imsByAssignee.firstErr ? ` (例: \`${phases.imsByAssignee.firstErr}\`)` : ''}`,
+    `• 合計 Slack削除: *${totalDeleted}件* / エラー: ${totalErrors}件`,
+  ];
+  if (totalErrors > 0 && totalDeleted < 5) {
+    lines.push('');
+    lines.push('💡 エラーが多く削除も少ない場合は scope 不足の可能性があります。必要 scope: `chat:write`, `im:read`, `im:history`, `mpim:read`, `mpim:history`, `channels:history`, `groups:history`');
+  }
+
+  await client.chat.postMessage({ channel, text: lines.join('\n') });
+}
+
+// Variant that returns the first error message so we can surface scope issues
+async function deleteBotMessagesInConversationVerbose(client, channelId, maxPages = 5) {
+  let deleted = 0, errors = 0, firstErr = null;
+  let cursor;
+  const recordErr = (e) => {
+    errors++;
+    if (!firstErr) firstErr = e?.data?.error || e.message;
+  };
+  for (let page = 0; page < maxPages; page++) {
+    try {
+      const params = { channel: channelId, limit: 200 };
+      if (cursor) params.cursor = cursor;
+      const r = await client.conversations.history(params);
+      for (const m of (r.messages || [])) {
+        const isBotMsg = m.user === botConfig.botUserId || m.bot_id;
+        if (isBotMsg) {
+          try {
+            await client.chat.delete({ channel: channelId, ts: m.ts });
+            deleted++;
+          } catch (e) { recordErr(e); }
+        }
+        if (m.reply_count > 0 && m.thread_ts === m.ts) {
+          try {
+            let replyCursor;
+            for (let rPage = 0; rPage < 3; rPage++) {
+              const rParams = { channel: channelId, ts: m.ts, limit: 100 };
+              if (replyCursor) rParams.cursor = replyCursor;
+              const rr = await client.conversations.replies(rParams);
+              for (const reply of (rr.messages || [])) {
+                if (reply.ts === m.ts) continue;
+                if (reply.user === botConfig.botUserId || reply.bot_id) {
+                  try {
+                    await client.chat.delete({ channel: channelId, ts: reply.ts });
+                    deleted++;
+                  } catch (e) { recordErr(e); }
+                }
+              }
+              replyCursor = rr.response_metadata?.next_cursor;
+              if (!replyCursor) break;
+            }
+          } catch (e) { /* replies fetch may fail; skip */ }
+        }
+      }
+      cursor = r.response_metadata?.next_cursor;
+      if (!cursor) break;
+    } catch (e) {
+      // history failure — bubble the code so we can show scope hints
+      if (!firstErr) firstErr = e?.data?.error || e.message;
+      console.error(`[reset] history failed for ${channelId} page ${page}:`, e.message);
+      break;
+    }
+  }
+  return { deleted, errors, firstErr };
 }
 
 // ── Diagnostics ─────────────────────────────────────────────────────────────────
