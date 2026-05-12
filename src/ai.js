@@ -145,17 +145,19 @@ Intent options:
   → Interpret relative dates (明日, 来週, 今週中) from JST time above; default time 10:00 JST
   → "前日にリマインド" → subtract one day from due_at
   → Ambiguous date → confidence < 0.6, add "due_at" to missing_fields
-  → カスタム絵文字（:emoji_name: 形式）も期限ヒントとして解釈：
+  → カスタム絵文字（:emoji_name: 形式）も期限ヒントとして解釈（**重要**: 日付絵文字を見つけたら必ずdue_atに反映すること）：
     【日付指定】
     - :asitakana: :asitayaro: :asitamatakite: :asita_tantou: :ashita: :ashitadeok: :ashitanokoban: :ashitayaru_明日_やる: → 翌日 23:59 JST
     - :kyouhamazi: :kyouyaro: → 今日 23:59 JST
     - :mataraisyuu: → 来週月曜 09:00 JST
-    - :tsyuuakeok: :tsyuuakeok_週明けok: :syuuakeok: :syuuake_ok: → 来週火曜 23:59 JST、かつ advance_notice_hours: 24（前日月曜に通知）
+    - :syuuakeok_週明けok: :syuuakeok: :syuuake_ok: :tsyuuakeok: → 次の月曜日 23:59 JST（今日基準で次に到来する月曜日。今日が月曜なら7日後）
     【時刻指定（既出の日付を修飾。日付なしなら今日）】
     - :9zisyussya: :asadayo: :asadazo: :asayarou: → 09:00
     - :gogosyussya: → 12:00
     - :mouyoru: :yorunoyoga: :yoruyarou: :yorukana: :yorudazo: → 23:59
-    例: "15日 :asadayo:" → 今月15日 09:00 / ":asitanokoban: :gogosyussya:" → 明日 12:00 / ":mataraisyuu: :mouyoru:" → 来週月曜 23:59 / ":tsyuuakeok:" → 来週火曜 23:59 + advance_notice_hours 24
+    **複数タスク + 末尾に日付絵文字の場合**: 各タスクに明示的な日付指定がなければ、その絵文字の日付を全タスクのdue_atに適用する。決して空のdue_atにしないこと。
+    例: "15日 :asadayo:" → 今月15日 09:00 / ":asitanokoban: :gogosyussya:" → 明日 12:00 / ":mataraisyuu: :mouyoru:" → 来週月曜 23:59 / ":syuuakeok_週明けok:" → 次の月曜日 23:59
+    例（複数タスク+絵文字）: "Aを借りる、Bを確保する、Cを確認する :syuuakeok_週明けok:" → 全3タスクのdue_atを次の月曜日 23:59 にセット
   → "X日前に通知" or "X時間前に通知" → set advance_notice_hours on that task
   → "このスレッドに通知" / "チャンネルで通知" / "DMじゃなく" / "ここに通知" → notification_target: "thread"
   → default notification_target: "dm"
@@ -315,17 +317,18 @@ Today's date and time (JST): ${jstNow}
 - task: 具体的なタスク内容（簡潔に、動詞で終わる形で）
 - assignee: 担当者（<@UXXXXXX> 形式。名前のみの場合はそのまま。メッセージの宛先 (<@U...>) を優先。不明な場合は null）${botNote}
 - due_at: 期限（ISO 8601 JST offset, e.g. "2026-05-20T10:00:00+09:00"）。会話中の日付・「15日」「来週」などから推測。不明な場合は null
-  カスタム絵文字（:emoji_name: 形式）も期限ヒントとして解釈：
+  カスタム絵文字（:emoji_name: 形式）も期限ヒントとして解釈（**重要**: 日付絵文字を見つけたら必ずdue_atに反映すること）：
   【日付指定】
   - :asitakana: :asitayaro: :asitamatakite: :asita_tantou: :ashita: :ashitadeok: :ashitanokoban: :ashitayaru_明日_やる: → 翌日 23:59 JST
   - :kyouhamazi: :kyouyaro: → 今日 23:59 JST
   - :mataraisyuu: → 来週月曜 09:00 JST
-  - :tsyuuakeok: :tsyuuakeok_週明けok: :syuuakeok: :syuuake_ok: → 来週火曜 23:59 JST、かつ advance_notice_hours: 24（前日月曜に通知）
+  - :syuuakeok_週明けok: :syuuakeok: :syuuake_ok: :tsyuuakeok: → 次の月曜日 23:59 JST（今日基準で次に到来する月曜日。今日が月曜なら7日後）
   【時刻指定（既出の日付を修飾。日付なしなら今日）】
   - :9zisyussya: :asadayo: :asadazo: :asayarou: → 09:00
   - :gogosyussya: → 12:00
   - :mouyoru: :yorunoyoga: :yoruyarou: :yorukana: :yorudazo: → 23:59
-  例: "15日 :asadayo:" → 今月15日 09:00 / ":asitanokoban: :gogosyussya:" → 明日 12:00 / ":tsyuuakeok:" → 来週火曜 23:59 + advance_notice_hours 24
+  **複数タスク + 末尾に日付絵文字の場合**: 各タスクに明示的な日付指定がなければ、その絵文字の日付を全タスクのdue_atに適用する。
+  例: "15日 :asadayo:" → 今月15日 09:00 / ":asitanokoban: :gogosyussya:" → 明日 12:00 / ":syuuakeok_週明けok:" → 次の月曜日 23:59
 - confidence: タスクである確信度 0.0-1.0
 
 Respond with JSON:
