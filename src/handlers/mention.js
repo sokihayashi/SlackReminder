@@ -5,6 +5,7 @@ const {
   getSetting, setSetting, getAllSettings,
   savePendingQuestion, deletePendingQuestion, findByThreadTs,
   findAllByConfirmationTs, getAllReminders, wipeAll,
+  getBotSentMessages, clearBotSentMessages, deleteBotSentMessage,
 } = require('../db');
 const { formatDueAt, formatHours, computeAdvanceNoticeHours, displayAssignee, silentAssigneeDisplay, silentDisplayAssignee, getDisplayName, CONFIDENCE_THRESHOLD, DEFAULT_ADVANCE_NOTICE_HOURS } = require('../utils');
 const botConfig = require('../botConfig');
@@ -975,59 +976,10 @@ async function handleReset(channel, replyThreadTs, client, code) {
  * Delete all messages authored by the bot in a single conversation (channel or DM),
  * paginating through history up to maxPages.
  */
+// (legacy stub — executeReset uses deleteBotMessagesInConversationVerbose)
 async function deleteBotMessagesInConversation(client, channelId, maxPages = 5) {
-  let deleted = 0, errors = 0;
-  let cursor;
-  for (let page = 0; page < maxPages; page++) {
-    try {
-      const params = { channel: channelId, limit: 200 };
-      if (cursor) params.cursor = cursor;
-      const r = await client.conversations.history(params);
-      for (const m of (r.messages || [])) {
-        // Delete top-level bot message
-        if (m.user === botConfig.botUserId || m.bot_id) {
-          try {
-            await client.chat.delete({ channel: channelId, ts: m.ts });
-            deleted++;
-          } catch (e) {
-            errors++;
-          }
-        }
-        // Also delete bot's replies inside any thread
-        if (m.reply_count > 0 && m.thread_ts === m.ts) {
-          try {
-            let replyCursor;
-            for (let rPage = 0; rPage < 3; rPage++) {
-              const rParams = { channel: channelId, ts: m.ts, limit: 100 };
-              if (replyCursor) rParams.cursor = replyCursor;
-              const rr = await client.conversations.replies(rParams);
-              for (const reply of (rr.messages || [])) {
-                if (reply.ts === m.ts) continue; // skip thread parent (already handled above)
-                if (reply.user === botConfig.botUserId || reply.bot_id) {
-                  try {
-                    await client.chat.delete({ channel: channelId, ts: reply.ts });
-                    deleted++;
-                  } catch (e) {
-                    errors++;
-                  }
-                }
-              }
-              replyCursor = rr.response_metadata?.next_cursor;
-              if (!replyCursor) break;
-            }
-          } catch (e) {
-            // conversations.replies may fail in DMs or private channels; skip silently
-          }
-        }
-      }
-      cursor = r.response_metadata?.next_cursor;
-      if (!cursor) break;
-    } catch (e) {
-      console.error(`[reset] history failed for ${channelId} page ${page}:`, e.message);
-      break;
-    }
-  }
-  return { deleted, errors };
+  const r = await deleteBotMessagesInConversationVerbose(client, channelId, maxPages, false);
+  return { deleted: r.deleted, errors: r.errors };
 }
 
 async function listAllIMConversations(client) {
@@ -1055,10 +1007,35 @@ async function executeReset(client, channel, ts) {
   } catch (_) {}
 
   const phases = {
+    tracked: { scanned: 0, deleted: 0, errors: 0, firstErr: null, fail: null },
     channels: { scanned: 0, deleted: 0, errors: 0, firstErr: null, fail: null },
     ims: { scanned: 0, deleted: 0, errors: 0, firstErr: null, fail: null },
     imsByAssignee: { scanned: 0, deleted: 0, errors: 0, firstErr: null, fail: null },
   };
+
+  // 0. Tracked messages — delete every (channel, ts) we recorded in bot_sent_messages.
+  //    This works regardless of im:read / im:history scope since we have the ts directly.
+  try {
+    const tracked = getBotSentMessages();
+    phases.tracked.scanned = tracked.length;
+    console.log(`[reset] deleting ${tracked.length} tracked bot messages`);
+    for (const { channel_id, ts } of tracked) {
+      try {
+        await client.chat.delete({ channel: channel_id, ts });
+        phases.tracked.deleted++;
+        deleteBotSentMessage(channel_id, ts);
+      } catch (e) {
+        phases.tracked.errors++;
+        if (!phases.tracked.firstErr) phases.tracked.firstErr = e?.data?.error || e.message;
+        // 'message_not_found' means already deleted — clear from table too
+        const code = e?.data?.error;
+        if (code === 'message_not_found') deleteBotSentMessage(channel_id, ts);
+      }
+    }
+  } catch (e) {
+    phases.tracked.fail = e?.data?.error || e.message;
+    console.error('[reset] tracked sweep failed:', e.message);
+  }
 
   // Collect known DM partners from reminders BEFORE we wipe the DB
   const knownAssigneeUserIds = new Set();
@@ -1071,11 +1048,10 @@ async function executeReset(client, channel, ts) {
     console.error('[reset] getAllReminders failed:', e.message);
   }
 
-  // Instrument deleteBotMessagesInConversation to bubble up first error message
-  const purge = async (id, phaseKey) => {
+  const purge = async (id, phaseKey, scanReplies = true) => {
     const phase = phases[phaseKey];
     try {
-      const r = await deleteBotMessagesInConversationVerbose(client, id, 5);
+      const r = await deleteBotMessagesInConversationVerbose(client, id, 5, scanReplies);
       phase.deleted += r.deleted;
       phase.errors += r.errors;
       if (!phase.firstErr && r.firstErr) phase.firstErr = r.firstErr;
@@ -1086,12 +1062,12 @@ async function executeReset(client, channel, ts) {
   };
 
   if (botConfig.botUserId) {
-    // 1. Member channels (public + private the bot is in)
+    // 1. Member channels (public + private the bot is in) — scan thread replies
     try {
       const channels = await listBotMemberChannels(client);
       phases.channels.scanned = channels.length;
       console.log(`[reset] purging ${channels.length} member channels`);
-      for (const ch of channels) await purge(ch.id, 'channels');
+      for (const ch of channels) await purge(ch.id, 'channels', true);
     } catch (e) {
       phases.channels.fail = e?.data?.error || e.message;
       console.error('[reset] member channel sweep failed:', e.message);
@@ -1102,7 +1078,7 @@ async function executeReset(client, channel, ts) {
       const ims = await listAllIMConversations(client);
       phases.ims.scanned = ims.length;
       console.log(`[reset] purging ${ims.length} IM conversations via conversations.list`);
-      for (const im of ims) await purge(im.id, 'ims');
+      for (const im of ims) await purge(im.id, 'ims', false); // DMs: no thread reply scan
     } catch (e) {
       phases.ims.fail = e?.data?.error || e.message;
       console.error('[reset] IM sweep failed:', e.message);
@@ -1124,7 +1100,7 @@ async function executeReset(client, channel, ts) {
         const dmId = open?.channel?.id;
         if (!dmId) continue;
         phases.imsByAssignee.scanned++;
-        await purge(dmId, 'imsByAssignee');
+        await purge(dmId, 'imsByAssignee', false); // DMs: no thread reply scan
       } catch (e) {
         phases.imsByAssignee.errors++;
         if (!phases.imsByAssignee.firstErr) phases.imsByAssignee.firstErr = e?.data?.error || e.message;
@@ -1135,17 +1111,24 @@ async function executeReset(client, channel, ts) {
   // 4. Wipe DB
   const wiped = wipeAll();
 
-  const totalDeleted = phases.channels.deleted + phases.ims.deleted + phases.imsByAssignee.deleted;
-  const totalErrors = phases.channels.errors + phases.ims.errors + phases.imsByAssignee.errors;
+  const totalDeleted = phases.tracked.deleted + phases.channels.deleted + phases.ims.deleted + phases.imsByAssignee.deleted;
+  const totalErrors = phases.tracked.errors + phases.channels.errors + phases.ims.errors + phases.imsByAssignee.errors;
 
   const lines = [
     `✅ RESET 完了。`,
     `• DB: リマインド ${wiped.reminders}件 / pending ${wiped.pending}件 削除`,
-    `• チャンネル: ${phases.channels.scanned}個 scan / ${phases.channels.deleted}件削除 / ${phases.channels.errors}エラー${phases.channels.fail ? ` (列挙失敗: \`${phases.channels.fail}\`)` : ''}${phases.channels.firstErr ? ` (例: \`${phases.channels.firstErr}\`)` : ''}`,
-    `• DM (im list): ${phases.ims.scanned}個 scan / ${phases.ims.deleted}件削除 / ${phases.ims.errors}エラー${phases.ims.fail ? ` (列挙失敗: \`${phases.ims.fail}\` — \`im:read\` 不足の可能性)` : ''}${phases.ims.firstErr ? ` (例: \`${phases.ims.firstErr}\`)` : ''}`,
+    `• 追跡済み (DB記録): ${phases.tracked.scanned}件 scan / ${phases.tracked.deleted}件削除 / ${phases.tracked.errors}エラー${phases.tracked.firstErr ? ` (例: \`${phases.tracked.firstErr}\`)` : ''}`,
+    `• チャンネル (履歴scan): ${phases.channels.scanned}個 scan / ${phases.channels.deleted}件削除 / ${phases.channels.errors}エラー${phases.channels.fail ? ` (列挙失敗: \`${phases.channels.fail}\`)` : ''}${phases.channels.firstErr ? ` (例: \`${phases.channels.firstErr}\`)` : ''}`,
+    `• DM (im list): ${phases.ims.scanned}個 scan / ${phases.ims.deleted}件削除 / ${phases.ims.errors}エラー${phases.ims.fail ? ` (列挙失敗: \`${phases.ims.fail}\` — \`im:read\` scope不足)` : ''}${phases.ims.firstErr ? ` (例: \`${phases.ims.firstErr}\`)` : ''}`,
     `• DM (assignee fallback): ${phases.imsByAssignee.scanned}個 scan / ${phases.imsByAssignee.deleted}件削除 / ${phases.imsByAssignee.errors}エラー${phases.imsByAssignee.firstErr ? ` (例: \`${phases.imsByAssignee.firstErr}\`)` : ''}`,
     `• 合計 Slack削除: *${totalDeleted}件* / エラー: ${totalErrors}件`,
   ];
+
+  if (phases.ims.fail || phases.imsByAssignee.errors > 0) {
+    lines.push('');
+    lines.push('ℹ️ 既存の古いDMメッセージを一掃するには `im:read` + `im:history` scope を Slack App OAuth設定に追加して reinstall してください。');
+    lines.push('   今後 bot が送る新しいメッセージは DB に自動記録されるので、scope なしでも次回 RESET で削除されます。');
+  }
   if (totalErrors > 0 && totalDeleted < 5) {
     lines.push('');
     lines.push('💡 エラーが多く削除も少ない場合は scope 不足の可能性があります。必要 scope: `chat:write`, `im:read`, `im:history`, `mpim:read`, `mpim:history`, `channels:history`, `groups:history`');
@@ -1154,8 +1137,8 @@ async function executeReset(client, channel, ts) {
   await client.chat.postMessage({ channel, text: lines.join('\n') });
 }
 
-// Variant that returns the first error message so we can surface scope issues
-async function deleteBotMessagesInConversationVerbose(client, channelId, maxPages = 5) {
+// Returns deleted/errors/firstErr. scanReplies=false for DM channels (bot never posts DM replies).
+async function deleteBotMessagesInConversationVerbose(client, channelId, maxPages = 5, scanReplies = true) {
   let deleted = 0, errors = 0, firstErr = null;
   let cursor;
   const recordErr = (e) => {
@@ -1175,7 +1158,9 @@ async function deleteBotMessagesInConversationVerbose(client, channelId, maxPage
             deleted++;
           } catch (e) { recordErr(e); }
         }
-        if (m.reply_count > 0 && m.thread_ts === m.ts) {
+        // Only scan thread replies for user-started threads (bot posts replies there).
+        // Skip if: DMs, bot-parent threads, or no replies.
+        if (scanReplies && m.reply_count > 0 && m.thread_ts === m.ts && !isBotMsg) {
           try {
             let replyCursor;
             for (let rPage = 0; rPage < 3; rPage++) {
@@ -1194,13 +1179,12 @@ async function deleteBotMessagesInConversationVerbose(client, channelId, maxPage
               replyCursor = rr.response_metadata?.next_cursor;
               if (!replyCursor) break;
             }
-          } catch (e) { /* replies fetch may fail; skip */ }
+          } catch (e) { /* skip on error */ }
         }
       }
       cursor = r.response_metadata?.next_cursor;
       if (!cursor) break;
     } catch (e) {
-      // history failure — bubble the code so we can show scope hints
       if (!firstErr) firstErr = e?.data?.error || e.message;
       console.error(`[reset] history failed for ${channelId} page ${page}:`, e.message);
       break;

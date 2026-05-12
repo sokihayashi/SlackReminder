@@ -41,6 +41,13 @@ db.exec(`
     created_at TEXT NOT NULL,
     PRIMARY KEY (channel_id, thread_ts)
   );
+
+  CREATE TABLE IF NOT EXISTS bot_sent_messages (
+    channel_id TEXT NOT NULL,
+    ts TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (channel_id, ts)
+  );
 `);
 
 // Migrations for existing databases
@@ -253,6 +260,32 @@ function deletePendingQuestion(channelId, threadTs) {
     .run(channelId, threadTs);
 }
 
+// ── Bot sent message tracking ──────────────────────────────────────────────
+
+function recordBotSentMessage(channelId, ts) {
+  if (!channelId || !ts) return;
+  try {
+    db.prepare(`
+      INSERT INTO bot_sent_messages (channel_id, ts, created_at) VALUES (?, ?, ?)
+      ON CONFLICT(channel_id, ts) DO NOTHING
+    `).run(channelId, ts, new Date().toISOString());
+  } catch (_) {}
+}
+
+function getBotSentMessages() {
+  return db.prepare(`SELECT channel_id, ts FROM bot_sent_messages ORDER BY created_at ASC`).all();
+}
+
+function clearBotSentMessages() {
+  const count = db.prepare(`SELECT COUNT(*) as c FROM bot_sent_messages`).get().c;
+  db.prepare(`DELETE FROM bot_sent_messages`).run();
+  return count;
+}
+
+function deleteBotSentMessage(channelId, ts) {
+  db.prepare(`DELETE FROM bot_sent_messages WHERE channel_id = ? AND ts = ?`).run(channelId, ts);
+}
+
 // ── Admin / reset ───────────────────────────────────────────────────────────
 
 function getAllReminders() {
@@ -299,6 +332,11 @@ module.exports = {
   savePendingQuestion,
   getPendingQuestion,
   deletePendingQuestion,
+  // bot sent message tracking
+  recordBotSentMessage,
+  getBotSentMessages,
+  clearBotSentMessages,
+  deleteBotSentMessage,
   // admin / reset
   getAllReminders,
   wipeAll,
