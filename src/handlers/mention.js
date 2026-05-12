@@ -227,10 +227,15 @@ function defaultDueAtJST(daysFromNow = 7) {
 
 async function bulkCreateReminders(tasks, source, client) {
   const fallbackDue = defaultDueAtJST(7);
+  const messageTs = source.messageTs || '';
+  const threadTs = source.threadTs || '';
   const results = [];
   for (const t of tasks) {
     const { assigneeSlackUserId, assigneeName } = resolveAssignee(t.assignee);
-    if (!assigneeSlackUserId && !assigneeName) continue;
+    if (!assigneeSlackUserId && !assigneeName) {
+      results.push({ task: t.task, status: 'error', errorMessage: '担当者不明' });
+      continue;
+    }
     const dueAt = t.due_at || fallbackDue;
     const hasDefaultDue = !t.due_at;
     try {
@@ -240,8 +245,8 @@ async function bulkCreateReminders(tasks, source, client) {
         assigneeSlackUserId,
         dueAt,
         sourceChannelId: source.channelId,
-        sourceMessageTs: source.messageTs,
-        sourceThreadTs: source.threadTs,
+        sourceMessageTs: messageTs,
+        sourceThreadTs: threadTs,
         createdBy: source.user,
         confidence: t.confidence ?? 1,
         advanceNoticeHours: t.advance_notice_hours ?? null,
@@ -252,7 +257,7 @@ async function bulkCreateReminders(tasks, source, client) {
       results.push({ task: t.task, assigneeDisplay, dueAt, hasDefaultDue, status: 'created' });
     } catch (err) {
       console.error('[bulk] createReminder error:', err.message);
-      results.push({ task: t.task, status: 'error' });
+      results.push({ task: t.task, status: 'error', errorMessage: err.message });
     }
   }
   return results;
@@ -407,10 +412,12 @@ async function handleExtractFromAllChannels(originChannel, replyThreadTs, curren
   }));
 
   const allResults = [];
+  const registerResults = new Map();
   for (const ch of perChannel) {
     const r = await bulkCreateReminders(ch.tasks, {
-      channelId: ch.channelId, messageTs: currentTs, threadTs: null, user, notificationTarget: 'dm',
+      channelId: originChannel, messageTs: currentTs, threadTs: replyThreadTs, user, notificationTarget: 'dm',
     }, client);
+    registerResults.set(ch.channelName, r);
     for (const item of r.filter(x => x.status === 'created')) {
       allResults.push({ channelName: ch.channelName, ...item });
     }
@@ -422,7 +429,11 @@ async function handleExtractFromAllChannels(originChannel, replyThreadTs, curren
       if (ch.error) status = `❌ ${ch.error}`;
       else if (ch.allTasks.length === 0) status = 'AI抽出: 0件';
       else if (ch.tasks.length === 0) status = `AI抽出: ${ch.allTasks.length}件 (全て信頼度<0.35)`;
-      else status = `AI抽出: ${ch.tasks.length}件 (担当者特定失敗)`;
+      else {
+        const errs = (registerResults.get(ch.channelName) || []).filter(x => x.status === 'error');
+        const firstErr = errs[0]?.errorMessage || '不明';
+        status = `AI抽出: ${ch.tasks.length}件 / 登録失敗: ${errs.length}件 (例: ${firstErr})`;
+      }
 
       const sample = ch.allTasks.slice(0, 3).map(t => {
         const conf = (t.confidence ?? 0).toFixed(2);
