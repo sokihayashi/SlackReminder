@@ -28,6 +28,44 @@ function parseJSON(raw) {
   }
 }
 
+/**
+ * Tolerant parser for AI responses containing { "tasks": [...] }.
+ * When the outer JSON is truncated mid-array, recover all complete task objects.
+ */
+function parseTasksJSON(raw) {
+  try {
+    return parseJSON(raw);
+  } catch (err) {
+    if (!/Unbalanced|No JSON/.test(err.message)) throw err;
+    const text = raw.replace(/^```(?:json)?\s*/m, '').trim();
+    const keyMatch = text.search(/"tasks"\s*:\s*\[/);
+    if (keyMatch === -1) throw err;
+    const bracketIdx = text.indexOf('[', keyMatch);
+    const tasks = [];
+    let i = bracketIdx + 1;
+    while (i < text.length) {
+      while (i < text.length && /[\s,]/.test(text[i])) i++;
+      if (i >= text.length || text[i] === ']') break;
+      if (text[i] !== '{') break;
+      let depth = 0, end = -1, inStr = false, esc = false;
+      for (let j = i; j < text.length; j++) {
+        const c = text[j];
+        if (esc) { esc = false; continue; }
+        if (c === '\\') { esc = true; continue; }
+        if (c === '"') { inStr = !inStr; continue; }
+        if (inStr) continue;
+        if (c === '{') depth++;
+        else if (c === '}') { depth--; if (depth === 0) { end = j; break; } }
+      }
+      if (end === -1) break;
+      try { tasks.push(JSON.parse(text.slice(i, end + 1))); }
+      catch (_) { break; }
+      i = end + 1;
+    }
+    return { tasks };
+  }
+}
+
 const VALID_INTENTS = [
   'create_reminder', 'query_tasks', 'cancel_reminder',
   'update_setting', 'set_summary_channel', 'remove_summary_channel',
@@ -245,7 +283,7 @@ async function extractTasksFromThread(threadMessages, referenceDate = new Date()
 
   const response = await client.chat.completions.create({
     model: MODEL,
-    max_tokens: 2048,
+    max_tokens: 8192,
     response_format: { type: 'json_object' },
     messages: [
       {
@@ -277,7 +315,7 @@ Respond with JSON:
     ],
   });
 
-  const parsed = parseJSON(response.choices[0].message.content);
+  const parsed = parseTasksJSON(response.choices[0].message.content);
   if (!Array.isArray(parsed.tasks)) return [];
   return parsed.tasks.filter(t => typeof t.task === 'string' && t.task.length > 0);
 }
