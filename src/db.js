@@ -126,6 +126,25 @@ function findAllByConfirmationTs(channelId, messageTs) {
   `).all(channelId, messageTs);
 }
 
+/**
+ * Returns all reminders that belong to the most recent bulk batch in a thread,
+ * ordered by created_at (so the user-visible numbering ⌗1, ⌗2, ... matches).
+ */
+function findLatestBulkByThreadTs(channelId, threadTs) {
+  const latest = db.prepare(`
+    SELECT confirmation_message_ts FROM reminders
+    WHERE source_channel_id = ? AND source_thread_ts = ?
+      AND confirmation_message_ts IS NOT NULL
+    ORDER BY created_at DESC LIMIT 1
+  `).get(channelId, threadTs);
+  if (!latest?.confirmation_message_ts) return [];
+  return db.prepare(`
+    SELECT * FROM reminders
+    WHERE source_channel_id = ? AND confirmation_message_ts = ?
+    ORDER BY created_at ASC
+  `).all(channelId, latest.confirmation_message_ts);
+}
+
 function approveReminder(id) {
   db.prepare(`UPDATE reminders SET status = 'pending', updated_at = ? WHERE id = ? AND status = 'draft'`)
     .run(new Date().toISOString(), id);
@@ -245,6 +264,7 @@ module.exports = {
   setConfirmationTs,
   findByConfirmationTs,
   findAllByConfirmationTs,
+  findLatestBulkByThreadTs,
   approveReminder,
   cancelReminder,
   restoreReminder,
