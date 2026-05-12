@@ -8,8 +8,9 @@ const { handleReaction } = require('./handlers/reaction');
 const { startScheduler } = require('./scheduler');
 
 const { handleThreadReply } = require('./handlers/thread');
-const { setSetting, setNotificationTarget, findByConfirmationTs, approveReminder, cancelReminder, getPendingQuestion, deletePendingQuestion, recordBotSentMessage } = require('./db');
-const { formatHours } = require('./utils');
+const { setSetting, setNotificationTarget, findByConfirmationTs, approveReminder, cancelReminder, getPendingQuestion, deletePendingQuestion, recordBotSentMessage, getReminderById, updateReminder } = require('./db');
+const { formatHours, formatDueAt } = require('./utils');
+const { extractModification } = require('./ai');
 
 // Validate required environment variables at startup
 const required = ['SLACK_BOT_TOKEN', 'SLACK_SIGNING_SECRET', 'OPENROUTER_API_KEY'];
@@ -178,6 +179,129 @@ app.action(/^set_notification_target__/, async ({ body, ack, client }) => {
   );
   const fallbackText = body.message.text || 'リマインド候補を作成しました。';
   await client.chat.update({ channel: body.channel.id, ts: body.message.ts, blocks: updatedBlocks, text: fallbackText });
+});
+
+// ── Per-item "修正" modal ──────────────────────────────────────────────────────
+
+const ADVANCE_NOTICE_OPTIONS = [0, 1, 2, 3, 6, 12, 24, 48].map(h => ({
+  text: { type: 'plain_text', text: h === 0 ? 'なし（当日のみ）' : `${formatHours(h)}前` },
+  value: String(h),
+}));
+
+app.action('bulk_modify_one', async ({ body, ack, client }) => {
+  await ack();
+  const reminderId = body.actions[0].value;
+  const channel = body.channel.id;
+  const confirmationTs = body.message.ts;
+  const reminder = getReminderById(reminderId);
+  if (!reminder) return;
+
+  const currentAdvanceOption = ADVANCE_NOTICE_OPTIONS.find(
+    o => o.value === String(reminder.advance_notice_hours ?? '')
+  );
+
+  await client.views.open({
+    trigger_id: body.trigger_id,
+    view: {
+      type: 'modal',
+      callback_id: 'bulk_modify_modal',
+      private_metadata: JSON.stringify({ reminderId, channel, confirmationTs }),
+      title: { type: 'plain_text', text: 'リマインド修正' },
+      submit: { type: 'plain_text', text: '保存' },
+      close: { type: 'plain_text', text: 'キャンセル' },
+      blocks: [
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: `*タスク:* ${reminder.task}\n*担当:* ${reminder.assignee_name || '（未設定）'}　*期限:* ${formatDueAt(reminder.due_at)}`,
+          },
+        },
+        { type: 'divider' },
+        {
+          type: 'input',
+          block_id: 'assignee_block',
+          optional: true,
+          label: { type: 'plain_text', text: '担当者を変更' },
+          hint: { type: 'plain_text', text: '<@U...> 形式またはお名前。空欄 = 変更しない' },
+          element: {
+            type: 'plain_text_input',
+            action_id: 'assignee_input',
+            placeholder: { type: 'plain_text', text: `現在: ${reminder.assignee_name || '（未設定）'}` },
+          },
+        },
+        {
+          type: 'input',
+          block_id: 'due_at_block',
+          optional: true,
+          label: { type: 'plain_text', text: '期限を変更' },
+          hint: { type: 'plain_text', text: '例: 明日17時 / 5月20日 / 来週月曜。空欄 = 変更しない' },
+          element: {
+            type: 'plain_text_input',
+            action_id: 'due_at_input',
+            placeholder: { type: 'plain_text', text: `現在: ${formatDueAt(reminder.due_at)}` },
+          },
+        },
+        {
+          type: 'input',
+          block_id: 'advance_notice_block',
+          optional: true,
+          label: { type: 'plain_text', text: '事前通知タイミングを変更' },
+          hint: { type: 'plain_text', text: '選択しない = 変更しない' },
+          element: {
+            type: 'static_select',
+            action_id: 'advance_notice_select',
+            placeholder: { type: 'plain_text', text: `現在: ${currentAdvanceOption ? currentAdvanceOption.text.text : '未設定'}` },
+            options: ADVANCE_NOTICE_OPTIONS,
+          },
+        },
+      ],
+    },
+  });
+});
+
+app.view('bulk_modify_modal', async ({ body, ack, client, view }) => {
+  await ack();
+
+  let { reminderId, channel, confirmationTs } = JSON.parse(view.private_metadata);
+  const vals = view.state.values;
+
+  const assigneeRaw = vals.assignee_block?.assignee_input?.value?.trim() || null;
+  const dueAtRaw    = vals.due_at_block?.due_at_input?.value?.trim() || null;
+  const advanceHoursStr = vals.advance_notice_block?.advance_notice_select?.selected_option?.value ?? null;
+
+  const update = {};
+
+  if (assigneeRaw) {
+    const m = assigneeRaw.match(/<@(U[A-Z0-9]+)>/) || assigneeRaw.match(/^(U[A-Z0-9]{6,})$/);
+    if (m) {
+      update.assigneeSlackUserId = m[1];
+      update.assigneeName = `<@${m[1]}>`;
+    } else {
+      update.assigneeName = assigneeRaw;
+      update.assigneeSlackUserId = null;
+    }
+  }
+
+  if (dueAtRaw) {
+    try {
+      const reminder = getReminderById(reminderId);
+      const mod = await extractModification(`期限を ${dueAtRaw} に変更して`, reminder);
+      if (mod?.due_at) update.dueAt = mod.due_at;
+    } catch (e) {
+      console.error('[bulk_modify_modal] due_at parse error:', e.message);
+    }
+  }
+
+  if (advanceHoursStr !== null) {
+    update.advanceNoticeHours = parseInt(advanceHoursStr, 10);
+  }
+
+  if (Object.keys(update).length > 0) {
+    updateReminder(reminderId, update);
+  }
+
+  await refreshBulkMessage(client, channel, confirmationTs);
 });
 
 // Thread reply handler: modification and restore instructions
