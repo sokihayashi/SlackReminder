@@ -97,7 +97,8 @@ app.action('bulk_cancel_all', async ({ body, ack, client }) => {
 });
 
 // Quick due-at buttons posted when AI extraction is missing due_at
-app.action('set_due_at_quick', async ({ body, ack, client }) => {
+// action_id format: set_due_at_quick__<index>
+app.action(/^set_due_at_quick__\d+$/, async ({ body, ack, client }) => {
   await ack();
   const dueText = body.actions[0].value;
   const channel = body.channel.id;
