@@ -720,13 +720,14 @@ function quickDueAtActionsBlock() {
     { label: '今週金曜 17時', value: '今週金曜 17時' },
     { label: '来週月曜 10時', value: '来週月曜 10時' },
   ];
+  // action_id must be unique within the actions block — use index suffix.
   return {
     type: 'actions',
-    elements: options.map(o => ({
+    elements: options.map((o, i) => ({
       type: 'button',
       text: { type: 'plain_text', text: o.label },
       value: o.value,
-      action_id: 'set_due_at_quick',
+      action_id: `set_due_at_quick__${i}`,
     })),
   };
 }
