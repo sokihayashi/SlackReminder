@@ -2,12 +2,12 @@ require('dotenv').config();
 
 const { App, LogLevel } = require('@slack/bolt');
 const botConfig = require('./botConfig');
-const { handleMention, notificationTargetBlock, handlePassiveDetection, handleBotJoinedChannel, bulkConfirmBlocks } = require('./handlers/mention');
+const { handleMention, notificationTargetBlock, handlePassiveDetection, handleBotJoinedChannel, bulkConfirmBlocks, refreshBulkMessage } = require('./handlers/mention');
 const { handleReaction } = require('./handlers/reaction');
 const { startScheduler } = require('./scheduler');
 
 const { handleThreadReply } = require('./handlers/thread');
-const { setSetting, setNotificationTarget, findByConfirmationTs, findAllByConfirmationTs, approveReminder, cancelReminder } = require('./db');
+const { setSetting, setNotificationTarget, findByConfirmationTs, approveReminder, cancelReminder, getPendingQuestion, deletePendingQuestion } = require('./db');
 const { formatHours } = require('./utils');
 
 // Validate required environment variables at startup
@@ -65,28 +65,6 @@ app.action(/^set_advance_notice_hours__\d+$/, async ({ body, ack, client }) => {
 });
 
 // ── Bulk draft confirm/cancel ──────────────────────────────────────────────────
-// Rebuilds the bulk confirmation Block Kit message from current DB state.
-async function refreshBulkMessage(client, channel, ts) {
-  const reminders = findAllByConfirmationTs(channel, ts);
-  if (reminders.length === 0) return;
-  const { silentAssigneeDisplay, computeAdvanceNoticeHours } = require('./utils');
-  const entries = await Promise.all(reminders.map(async (r, i) => ({
-    id: r.id,
-    index: i + 1,
-    task: r.task,
-    assigneeDisplay: await silentAssigneeDisplay(client, r.assignee_slack_user_id, r.assignee_name),
-    dueAt: r.due_at,
-    hasDefaultDue: false,
-    advanceNoticeHours: r.advance_notice_hours,
-    _status: r.status === 'pending' ? 'pending' : r.status === 'cancelled' ? 'cancelled' : 'draft',
-  })));
-  const blocks = bulkConfirmBlocks(entries);
-  const draftCount = entries.filter(e => e._status === 'draft').length;
-  const headerText = draftCount > 0
-    ? `📋 ${entries.length} 件のリマインド候補。${draftCount} 件未確定。`
-    : `📋 ${entries.length} 件のリマインドを処理しました。`;
-  await client.chat.update({ channel, ts, text: headerText, blocks });
-}
 
 app.action('bulk_approve_one', async ({ body, ack, client }) => {
   await ack();
@@ -116,6 +94,37 @@ app.action('bulk_cancel_all', async ({ body, ack, client }) => {
     for (const id of ids) cancelReminder(id);
   } catch (e) { console.error('[bulk_cancel_all] parse failed:', e.message); }
   await refreshBulkMessage(client, body.channel.id, body.message.ts);
+});
+
+// Quick due-at buttons posted when AI extraction is missing due_at
+app.action('set_due_at_quick', async ({ body, ack, client }) => {
+  await ack();
+  const dueText = body.actions[0].value;
+  const channel = body.channel.id;
+  const thread_ts = body.message.thread_ts || body.message.ts;
+  const pending = getPendingQuestion(channel, thread_ts);
+  if (!pending) {
+    await client.chat.postMessage({
+      channel, thread_ts,
+      text: '元の依頼情報の有効期限が切れました。もう一度メンションして依頼し直してください。',
+    });
+    return;
+  }
+  // Acknowledge selection in the original buttons message
+  try {
+    await client.chat.update({
+      channel, ts: body.message.ts,
+      text: `期限を「${dueText}」で処理中…`,
+      blocks: [{ type: 'section', text: { type: 'mrkdwn', text: `⏳ 期限を *${dueText}* で処理中…` } }],
+    });
+  } catch (e) { /* ignore */ }
+
+  // Re-route through handleMention with chosen due-at appended as priorText follow-up
+  await handleMention({
+    event: { text: dueText, channel, ts: pending.source_message_ts, thread_ts, user: body.user.id },
+    client,
+    priorText: pending.original_text,
+  });
 });
 
 // Action handler: notification target toggle (DM ↔ スレッド)
