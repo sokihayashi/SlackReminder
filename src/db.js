@@ -31,6 +31,16 @@ db.exec(`
     value TEXT NOT NULL,
     updated_at TEXT NOT NULL
   );
+
+  CREATE TABLE IF NOT EXISTS pending_questions (
+    channel_id TEXT NOT NULL,
+    thread_ts TEXT NOT NULL,
+    original_text TEXT NOT NULL,
+    source_message_ts TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (channel_id, thread_ts)
+  );
 `);
 
 // Migrations for existing databases
@@ -50,7 +60,7 @@ function toUtcISO(dateStr) {
   return d.toISOString();
 }
 
-// ── Settings ─────────────────────────────────────────────────────────────────
+// ── Settings ───────────────────────────────────────────────────────────────
 
 function getSetting(key, defaultValue = null) {
   const row = db.prepare(`SELECT value FROM settings WHERE key = ?`).get(key);
@@ -68,7 +78,7 @@ function getAllSettings() {
   return db.prepare(`SELECT key, value FROM settings ORDER BY key`).all();
 }
 
-// ── Reminders ─────────────────────────────────────────────────────────────────
+// ── Reminders ───────────────────────────────────────────────────────────────
 
 function createReminder({ task, assigneeName, assigneeSlackUserId, dueAt, sourceChannelId, sourceMessageTs, sourceThreadTs, createdBy, confidence, advanceNoticeHours, notificationTarget = 'dm' }) {
   const now = new Date().toISOString();
@@ -185,6 +195,37 @@ function updateReminder(id, { assigneeName, assigneeSlackUserId, dueAt } = {}) {
   db.prepare(`UPDATE reminders SET ${fields.join(', ')} WHERE id = ?`).run(...values);
 }
 
+// ── Pending questions ───────────────────────────────────────────────────────
+
+const PENDING_QUESTION_TTL_MS = 60 * 60 * 1000; // 1 hour
+
+function savePendingQuestion({ channelId, threadTs, originalText, sourceMessageTs, createdBy }) {
+  db.prepare(`
+    INSERT INTO pending_questions (channel_id, thread_ts, original_text, source_message_ts, created_by, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT(channel_id, thread_ts) DO UPDATE SET
+      original_text = excluded.original_text,
+      source_message_ts = excluded.source_message_ts,
+      created_at = excluded.created_at
+  `).run(channelId, threadTs, originalText, sourceMessageTs, createdBy, new Date().toISOString());
+}
+
+function getPendingQuestion(channelId, threadTs) {
+  const row = db.prepare(`SELECT * FROM pending_questions WHERE channel_id = ? AND thread_ts = ?`)
+    .get(channelId, threadTs);
+  if (!row) return null;
+  if (Date.now() - new Date(row.created_at).getTime() > PENDING_QUESTION_TTL_MS) {
+    deletePendingQuestion(channelId, threadTs);
+    return null;
+  }
+  return row;
+}
+
+function deletePendingQuestion(channelId, threadTs) {
+  db.prepare(`DELETE FROM pending_questions WHERE channel_id = ? AND thread_ts = ?`)
+    .run(channelId, threadTs);
+}
+
 module.exports = {
   // settings
   getSetting,
@@ -207,4 +248,8 @@ module.exports = {
   getPendingByAssignee,
   findByThreadTs,
   updateReminder,
+  // pending questions
+  savePendingQuestion,
+  getPendingQuestion,
+  deletePendingQuestion,
 };

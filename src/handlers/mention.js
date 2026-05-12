@@ -3,29 +3,35 @@ const {
   createReminder, setConfirmationTs, setNotificationTarget,
   getAllPending, getPendingByAssignee, cancelReminder,
   getSetting, setSetting, getAllSettings,
+  savePendingQuestion, deletePendingQuestion,
 } = require('../db');
 const { formatDueAt, formatHours, displayAssignee, silentAssigneeDisplay, silentDisplayAssignee, getDisplayName, CONFIDENCE_THRESHOLD, DEFAULT_ADVANCE_NOTICE_HOURS } = require('../utils');
 const botConfig = require('../botConfig');
 
-async function handleMention({ event, client }) {
+async function handleMention({ event, client, priorText = null }) {
   const { text, channel, ts, thread_ts, user } = event;
   const replyThreadTs = thread_ts || ts;
 
-  console.log(`[mention] user=${user} channel=${channel}`);
+  console.log(`[mention] user=${user} channel=${channel}${priorText ? ' (follow-up)' : ''}`);
 
   try {
-    // Fast-path: keyword match before calling AI
-    const bare = text.replace(/<@[^>]+>/g, '').trim();
-    if (/^(ヘルプ|help|使い方|つかいかた)\??$/i.test(bare)) {
-      await postHelp(channel, replyThreadTs, client);
-      return;
+    // Fast-path: keyword match before calling AI (only for first-turn)
+    if (!priorText) {
+      const bare = text.replace(/<@[^>]+>/g, '').trim();
+      if (/^(ヘルプ|help|使い方|つかいかた)\??$/i.test(bare)) {
+        await postHelp(channel, replyThreadTs, client);
+        return;
+      }
     }
 
     const threadMessages = await fetchThreadContext(client, channel, thread_ts, ts);
     const botMentionPattern = botConfig.botUserId
       ? new RegExp(`<@${botConfig.botUserId}>`, 'g')
       : null;
-    const cleanText = botMentionPattern ? text.replace(botMentionPattern, '').trim() : text;
+    const stripBot = (s) => botMentionPattern ? s.replace(botMentionPattern, '').trim() : s;
+    const cleanText = priorText
+      ? `${stripBot(priorText)}\n${stripBot(text)}`
+      : stripBot(text);
     const extraction = await extractReminder(cleanText, new Date(), threadMessages);
 
     switch (extraction.intent) {
@@ -50,10 +56,17 @@ async function handleMention({ event, client }) {
       const missing = extraction.missing_fields?.length > 0
         ? extraction.missing_fields.join('、')
         : '日時または担当者';
+      savePendingQuestion({
+        channelId: channel,
+        threadTs: replyThreadTs,
+        originalText: cleanText,
+        sourceMessageTs: ts,
+        createdBy: user,
+      });
       await client.chat.postMessage({
         channel,
         thread_ts: replyThreadTs,
-        text: `リマインドの作成に必要な情報が不足しています。\n不足情報：*${missing}*\n\nもう少し詳しく教えてください。`,
+        text: `リマインドの作成に必要な情報が不足しています。\n不足情報：*${missing}*\n\nこのスレッドに返信して詳細を教えてください（メンション不要）。`,
       });
       return;
     }
@@ -61,13 +74,22 @@ async function handleMention({ event, client }) {
     const { assigneeSlackUserId, assigneeName } = resolveAssignee(extraction.assignee);
 
     if (!assigneeSlackUserId && !assigneeName) {
+      savePendingQuestion({
+        channelId: channel,
+        threadTs: replyThreadTs,
+        originalText: cleanText,
+        sourceMessageTs: ts,
+        createdBy: user,
+      });
       await client.chat.postMessage({
         channel,
         thread_ts: replyThreadTs,
-        text: 'リマインドの作成に必要な情報が不足しています。\n不足情報：*担当者*\n\n担当する人をメンションで指定してください。',
+        text: 'リマインドの作成に必要な情報が不足しています。\n不足情報：*担当者*\n\n担当する人をスレッド返信でメンションしてください（bot へのメンション不要）。',
       });
       return;
     }
+
+    deletePendingQuestion(channel, replyThreadTs);
 
     const notifTarget = extraction.notification_target === 'thread' ? 'thread' : 'dm';
 

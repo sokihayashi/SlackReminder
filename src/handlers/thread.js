@@ -1,9 +1,22 @@
 const { extractModification } = require('../ai');
-const { findByThreadTs, updateReminder, restoreReminder, approveReminder } = require('../db');
+const { findByThreadTs, updateReminder, restoreReminder, approveReminder, getPendingQuestion, deletePendingQuestion } = require('../db');
 const { formatDueAt, silentDisplayAssignee, silentAssigneeDisplay } = require('../utils');
+const { handleMention } = require('./mention');
 
 async function handleThreadReply({ message, client }) {
-  const { text, channel, thread_ts } = message;
+  const { text, channel, thread_ts, ts, user } = message;
+
+  // First: handle follow-up to "missing info" question (no mention needed)
+  const pending = getPendingQuestion(channel, thread_ts);
+  if (pending) {
+    deletePendingQuestion(channel, thread_ts);
+    await handleMention({
+      event: { text, channel, ts, thread_ts, user },
+      client,
+      priorText: pending.original_text,
+    });
+    return;
+  }
 
   const reminder = findByThreadTs(channel, thread_ts);
   if (!reminder) return;
