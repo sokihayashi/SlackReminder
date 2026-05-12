@@ -1,0 +1,26 @@
+name: Force Restart Bot
+
+on:
+  workflow_dispatch:
+
+jobs:
+  restart:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cancel running and queued bot workflows
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: |
+          for status in in_progress queued; do
+            gh run list --workflow=bot.yml --status=$status \
+              --json databaseId --jq '.[].databaseId' \
+              | xargs -r -I {} gh run cancel {} --repo ${{ github.repository }} || true
+          done
+
+      - name: Wait for cancellation to settle
+        run: sleep 15
+
+      - name: Start fresh bot run
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
+        run: gh workflow run bot.yml --repo ${{ github.repository }}
