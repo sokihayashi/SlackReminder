@@ -81,8 +81,10 @@ Determine the user's intent, then extract fields accordingly.
 
 Intent options:
 - "create_reminder": user wants to set a new reminder
-  → The first <@UXXXXXXX> in the message is the bot — ignore it for assignee
-  → Other <@UXXXXXXX> mentions are the assignee; also infer from thread context
+  → The user message has been pre-processed: the bot's own mention is already stripped
+  → Any <@UXXXXXXX> remaining in the message is the assignee (a human, never the bot itself)
+  → If no <@UXXXXXXX> in the message, try to infer the assignee from thread context
+  → Never use the bot as the assignee. If no human assignee can be determined, add "assignee" to missing_fields and set assignee=null
   → Interpret relative dates (明日, 来週, 今週中) from JST time above; default time 10:00 JST
   → "前日にリマインド" → subtract one day from due_at
   → Ambiguous date → confidence < 0.6, add "due_at" to missing_fields
@@ -147,7 +149,7 @@ async function resolveCancelTarget(userMessage, pendingReminders) {
     `${i + 1}. id=${r.id}  担当=${r.assignee_name}  タスク=${r.task}  期限=${r.due_at}`
   ).join('\n');
 
-  const prompt = `あなたはSlackリマインドBotのキャンセル意図解析アシスタントです。\nユーザーのメッセージと現在のペンディングリマインド一覧から、何をキャンセルしたいかを判定してください。\n\nペンディング一覧:\n${list}\n\nscope の決め方:\n- "all": 対象を絞らず全部を消したい。例: 「全部キャンセル」「ぜんぶ消して」「クリア」「リセット」「全件削除」「リマインド全部やめて」「すべて取り消し」など意味的に「すべて対象」のとき。\n- "one": 一覧の中の特定1件を確実にロックオンできる場合のみ（担当・タスク・期限の組み合わせで一意に決まる）。\n- "by_assignee": 特定の担当者は明確だがその人の中で1件に絞れない／複数を一括で消したい。例: 「はやしのリマインド解除」「@田中のタスク全部キャンセル」「林さんのやつ消して」\n- "none": 上記いずれにも当てはまらない・あいまい・候補が複数で絞れない。\n\nRespond with JSON:\n- scope: "all" | "one" | "by_assignee" | "none"\n- reminder_id: string (scope="one" のときのみ、一覧の id) | null\n- assignee_filter: string (scope="by_assignee" のとき、一覧の担当=表記をそのままコピー。例: "<@U123>" または "はやし") | null\n- reason: 判断理由（短く）`;
+  const prompt = `あなたはSlackリマインドBotのキャンセル意図解析アシスタントです。\nユーザーのメッセージと現在のペンディングリマインド一覧から、何をキャンセルしたいかを判定してください。\n\nペンディング一覧:\n${list}\n\nscope の決め方:\n- "all": 対象を絞らず全部を消したい。例: 「全部キャンセル」「ぜんぶ消して」「クリア」「リセット」「全件削除」「リマインド全部やめて」「すべて取り消し」など意味的に「すべて対象」のとき。\n- "one": 一覧の中の特定1件を確実にロックオンできる場合のみ（担当・タスク・期限の組み合わせで一意に決まる）。\n- "by_assignee": 特定の担当者は明確だがその人の中で1件に絞れない／複数を一括で消したい。例: 「はやしのリマインド解除」「@田中のタスク全部キャンセル」「林さんのやつ消して」\n- "none": 上記いずれにも当てはまらない・あいまい・候補が複数で絞れない。\n\nRespond with JSON:\n- scope: "all" | "one" | "by_assignee" | "none"\n- reminder_id: string (scope="one" のときのみ、一覧の id) | null\n- assignee_filter: string (scope="by_assignee" のとき、一覧の担当=表記をそのままコピー。例: "<@U123>" または "はやし"） | null\n- reason: 判断理由（短く）`;
 
   const response = await client.chat.completions.create({
     model: MODEL,

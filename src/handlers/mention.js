@@ -22,7 +22,11 @@ async function handleMention({ event, client }) {
     }
 
     const threadMessages = await fetchThreadContext(client, channel, thread_ts, ts);
-    const extraction = await extractReminder(text, new Date(), threadMessages);
+    const botMentionPattern = botConfig.botUserId
+      ? new RegExp(`<@${botConfig.botUserId}>`, 'g')
+      : null;
+    const cleanText = botMentionPattern ? text.replace(botMentionPattern, '').trim() : text;
+    const extraction = await extractReminder(cleanText, new Date(), threadMessages);
 
     switch (extraction.intent) {
       case 'query_tasks':           return handleTaskQuery(extraction, channel, replyThreadTs, client);
@@ -55,6 +59,15 @@ async function handleMention({ event, client }) {
     }
 
     const { assigneeSlackUserId, assigneeName } = resolveAssignee(extraction.assignee);
+
+    if (!assigneeSlackUserId && !assigneeName) {
+      await client.chat.postMessage({
+        channel,
+        thread_ts: replyThreadTs,
+        text: 'リマインドの作成に必要な情報が不足しています。\n不足情報：*担当者*\n\n担当する人をメンションで指定してください。',
+      });
+      return;
+    }
 
     const notifTarget = extraction.notification_target === 'thread' ? 'thread' : 'dm';
 
@@ -424,7 +437,10 @@ async function fetchThreadContext(client, channel, thread_ts, currentTs) {
 function resolveAssignee(rawAssignee) {
   const name = rawAssignee || '(未設定)';
   const m = name.match(/^<@(U[A-Z0-9]+)>$/) || name.match(/^(U[A-Z0-9]{6,})$/);
-  if (m) return { assigneeSlackUserId: m[1], assigneeName: `<@${m[1]}>` };
+  if (m) {
+    if (m[1] === botConfig.botUserId) return { assigneeSlackUserId: null, assigneeName: null };
+    return { assigneeSlackUserId: m[1], assigneeName: `<@${m[1]}>` };
+  }
   return { assigneeSlackUserId: null, assigneeName: name };
 }
 
