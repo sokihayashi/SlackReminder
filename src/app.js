@@ -7,7 +7,7 @@ const { handleReaction } = require('./handlers/reaction');
 const { startScheduler } = require('./scheduler');
 
 const { handleThreadReply } = require('./handlers/thread');
-const { setSetting, setNotificationTarget, findByConfirmationTs, approveReminder, cancelReminder, getPendingQuestion, deletePendingQuestion } = require('./db');
+const { setSetting, setNotificationTarget, findByConfirmationTs, approveReminder, cancelReminder, getPendingQuestion, deletePendingQuestion, recordBotSentMessage } = require('./db');
 const { formatHours } = require('./utils');
 
 // Validate required environment variables at startup
@@ -29,6 +29,17 @@ const app = new App({
   port: Number(process.env.PORT) || 3000,
   logLevel: LogLevel.INFO,
 });
+
+// Track every message the bot sends so RESET can delete them even without im:read scope.
+// Monkey-patch app.client.chat.postMessage — Bolt passes this same WebClient to all handlers.
+const _origPostMessage = app.client.chat.postMessage.bind(app.client.chat);
+app.client.chat.postMessage = async (opts) => {
+  const result = await _origPostMessage(opts);
+  if (result?.ok && result?.channel && result?.ts) {
+    recordBotSentMessage(result.channel, result.ts);
+  }
+  return result;
+};
 
 // Debug: log all incoming events
 app.use(async ({ payload, next }) => {

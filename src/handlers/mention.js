@@ -5,6 +5,7 @@ const {
   getSetting, setSetting, getAllSettings,
   savePendingQuestion, deletePendingQuestion, findByThreadTs,
   findAllByConfirmationTs, getAllReminders, wipeAll,
+  getBotSentMessages, clearBotSentMessages, deleteBotSentMessage,
 } = require('../db');
 const { formatDueAt, formatHours, computeAdvanceNoticeHours, displayAssignee, silentAssigneeDisplay, silentDisplayAssignee, getDisplayName, CONFIDENCE_THRESHOLD, DEFAULT_ADVANCE_NOTICE_HOURS } = require('../utils');
 const botConfig = require('../botConfig');
@@ -1006,10 +1007,35 @@ async function executeReset(client, channel, ts) {
   } catch (_) {}
 
   const phases = {
+    tracked: { scanned: 0, deleted: 0, errors: 0, firstErr: null, fail: null },
     channels: { scanned: 0, deleted: 0, errors: 0, firstErr: null, fail: null },
     ims: { scanned: 0, deleted: 0, errors: 0, firstErr: null, fail: null },
     imsByAssignee: { scanned: 0, deleted: 0, errors: 0, firstErr: null, fail: null },
   };
+
+  // 0. Tracked messages — delete every (channel, ts) we recorded in bot_sent_messages.
+  //    This works regardless of im:read / im:history scope since we have the ts directly.
+  try {
+    const tracked = getBotSentMessages();
+    phases.tracked.scanned = tracked.length;
+    console.log(`[reset] deleting ${tracked.length} tracked bot messages`);
+    for (const { channel_id, ts } of tracked) {
+      try {
+        await client.chat.delete({ channel: channel_id, ts });
+        phases.tracked.deleted++;
+        deleteBotSentMessage(channel_id, ts);
+      } catch (e) {
+        phases.tracked.errors++;
+        if (!phases.tracked.firstErr) phases.tracked.firstErr = e?.data?.error || e.message;
+        // 'message_not_found' means already deleted — clear from table too
+        const code = e?.data?.error;
+        if (code === 'message_not_found') deleteBotSentMessage(channel_id, ts);
+      }
+    }
+  } catch (e) {
+    phases.tracked.fail = e?.data?.error || e.message;
+    console.error('[reset] tracked sweep failed:', e.message);
+  }
 
   // Collect known DM partners from reminders BEFORE we wipe the DB
   const knownAssigneeUserIds = new Set();
@@ -1085,17 +1111,24 @@ async function executeReset(client, channel, ts) {
   // 4. Wipe DB
   const wiped = wipeAll();
 
-  const totalDeleted = phases.channels.deleted + phases.ims.deleted + phases.imsByAssignee.deleted;
-  const totalErrors = phases.channels.errors + phases.ims.errors + phases.imsByAssignee.errors;
+  const totalDeleted = phases.tracked.deleted + phases.channels.deleted + phases.ims.deleted + phases.imsByAssignee.deleted;
+  const totalErrors = phases.tracked.errors + phases.channels.errors + phases.ims.errors + phases.imsByAssignee.errors;
 
   const lines = [
     `✅ RESET 完了。`,
     `• DB: リマインド ${wiped.reminders}件 / pending ${wiped.pending}件 削除`,
-    `• チャンネル: ${phases.channels.scanned}個 scan / ${phases.channels.deleted}件削除 / ${phases.channels.errors}エラー${phases.channels.fail ? ` (列挙失敗: \`${phases.channels.fail}\`)` : ''}${phases.channels.firstErr ? ` (例: \`${phases.channels.firstErr}\`)` : ''}`,
-    `• DM (im list): ${phases.ims.scanned}個 scan / ${phases.ims.deleted}件削除 / ${phases.ims.errors}エラー${phases.ims.fail ? ` (列挙失敗: \`${phases.ims.fail}\` — \`im:read\` 不足の可能性)` : ''}${phases.ims.firstErr ? ` (例: \`${phases.ims.firstErr}\`)` : ''}`,
+    `• 追跡済み (DB記録): ${phases.tracked.scanned}件 scan / ${phases.tracked.deleted}件削除 / ${phases.tracked.errors}エラー${phases.tracked.firstErr ? ` (例: \`${phases.tracked.firstErr}\`)` : ''}`,
+    `• チャンネル (履歴scan): ${phases.channels.scanned}個 scan / ${phases.channels.deleted}件削除 / ${phases.channels.errors}エラー${phases.channels.fail ? ` (列挙失敗: \`${phases.channels.fail}\`)` : ''}${phases.channels.firstErr ? ` (例: \`${phases.channels.firstErr}\`)` : ''}`,
+    `• DM (im list): ${phases.ims.scanned}個 scan / ${phases.ims.deleted}件削除 / ${phases.ims.errors}エラー${phases.ims.fail ? ` (列挙失敗: \`${phases.ims.fail}\` — \`im:read\` scope不足)` : ''}${phases.ims.firstErr ? ` (例: \`${phases.ims.firstErr}\`)` : ''}`,
     `• DM (assignee fallback): ${phases.imsByAssignee.scanned}個 scan / ${phases.imsByAssignee.deleted}件削除 / ${phases.imsByAssignee.errors}エラー${phases.imsByAssignee.firstErr ? ` (例: \`${phases.imsByAssignee.firstErr}\`)` : ''}`,
     `• 合計 Slack削除: *${totalDeleted}件* / エラー: ${totalErrors}件`,
   ];
+
+  if (phases.ims.fail || phases.imsByAssignee.errors > 0) {
+    lines.push('');
+    lines.push('ℹ️ 既存の古いDMメッセージを一掃するには `im:read` + `im:history` scope を Slack App OAuth設定に追加して reinstall してください。');
+    lines.push('   今後 bot が送る新しいメッセージは DB に自動記録されるので、scope なしでも次回 RESET で削除されます。');
+  }
   if (totalErrors > 0 && totalDeleted < 5) {
     lines.push('');
     lines.push('💡 エラーが多く削除も少ない場合は scope 不足の可能性があります。必要 scope: `chat:write`, `im:read`, `im:history`, `mpim:read`, `mpim:history`, `channels:history`, `groups:history`');
