@@ -253,6 +253,24 @@ function deletePendingQuestion(channelId, threadTs) {
     .run(channelId, threadTs);
 }
 
+// ── Admin / reset ───────────────────────────────────────────────────────────
+
+function getAllReminders() {
+  return db.prepare(`SELECT * FROM reminders`).all();
+}
+
+/**
+ * Wipe all reminder data. Preserves settings (notification timing, summary channel)
+ * so the bot keeps its configuration after a reset.
+ */
+function wipeAll() {
+  const reminders = db.prepare(`SELECT COUNT(*) as c FROM reminders`).get().c;
+  const pending = db.prepare(`SELECT COUNT(*) as c FROM pending_questions`).get().c;
+  db.prepare(`DELETE FROM reminders`).run();
+  db.prepare(`DELETE FROM pending_questions`).run();
+  return { reminders, pending };
+}
+
 module.exports = {
   // settings
   getSetting,
@@ -281,4 +299,7 @@ module.exports = {
   savePendingQuestion,
   getPendingQuestion,
   deletePendingQuestion,
+  // admin / reset
+  getAllReminders,
+  wipeAll,
 };
