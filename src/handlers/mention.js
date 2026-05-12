@@ -63,11 +63,17 @@ async function handleMention({ event, client, priorText = null, silentOnNone = f
       return;
     }
 
-    if (extraction.confidence < CONFIDENCE_THRESHOLD || extraction.missing_fields?.length > 0) {
-      const missing = extraction.missing_fields?.length > 0
-        ? extraction.missing_fields.join('、')
+    // Trust task-level data over AI's missing_fields (AI sometimes flags fields as missing
+    // even when it populated them). Re-derive from the actual tasks array.
+    const missingFromTasks = [];
+    if (extraction.tasks.every(t => !t.due_at)) missingFromTasks.push('due_at');
+    if (extraction.tasks.every(t => !t.assignee)) missingFromTasks.push('assignee');
+
+    if (extraction.confidence < CONFIDENCE_THRESHOLD || missingFromTasks.length > 0) {
+      const missing = missingFromTasks.length > 0
+        ? missingFromTasks.join('、')
         : '日時または担当者';
-      const needsDueAt = extraction.missing_fields?.includes('due_at') || extraction.missing_fields?.includes('日時');
+      const needsDueAt = missingFromTasks.includes('due_at');
       savePendingQuestion({
         channelId: channel,
         threadTs: replyThreadTs,
