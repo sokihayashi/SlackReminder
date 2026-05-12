@@ -5,6 +5,12 @@ on:
   schedule:
     - cron: '0 */12 * * *'  # 12時間ごとのセーフティネット（通常は自己トリガーで継続）
 
+# Singleton: bot プロセスを常に1つだけ走らせる。
+# 既に in-progress があれば後発は queued になり、queued が複数になると古いものは GitHub 側で自動キャンセル。
+concurrency:
+  group: slack-reminder-bot-singleton
+  cancel-in-progress: false
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
