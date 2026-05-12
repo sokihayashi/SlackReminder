@@ -1,7 +1,7 @@
 const { extractModification } = require('../ai');
-const { findByThreadTs, updateReminder, restoreReminder, approveReminder, getPendingQuestion, deletePendingQuestion } = require('../db');
+const { findByThreadTs, updateReminder, restoreReminder, approveReminder, cancelReminder, getPendingQuestion, deletePendingQuestion, findLatestBulkByThreadTs } = require('../db');
 const { formatDueAt, silentDisplayAssignee, silentAssigneeDisplay } = require('../utils');
-const { handleMention } = require('./mention');
+const { handleMention, refreshBulkMessage } = require('./mention');
 const botConfig = require('../botConfig');
 
 // In-memory cache: `${channel}:${thread_ts}` → boolean
@@ -95,7 +95,11 @@ async function handleThreadReply({ message, client }) {
     }
   }
 
-  // 3. NEW: Auto-engagement — if the bot has previously posted in this thread,
+  // 3. NEW: Number-prefixed bulk modification ("⌗1 の期限を 明日17時 に", "2 をキャンセル" 等)
+  const numHandled = await handleNumberedBulkAction({ text, channel, thread_ts, client });
+  if (numHandled) return;
+
+  // 4. NEW: Auto-engagement — if the bot has previously posted in this thread,
   // treat any reply as if the bot were mentioned (silent on irrelevant chat).
   const engaged = await isBotEngagedInThread(client, channel, thread_ts);
   if (engaged) {
@@ -105,6 +109,97 @@ async function handleThreadReply({ message, client }) {
       silentOnNone: true,
     });
   }
+}
+
+/**
+ * Detect a leading "N" / "⌗N" / "#N" / "N." pattern and route to the Nth
+ * reminder in the latest bulk batch posted to this thread.
+ * Returns true if the message was handled (caller should stop).
+ */
+async function handleNumberedBulkAction({ text, channel, thread_ts, client }) {
+  const m = text.match(/^\s*[⌗#＃]?\s*(\d{1,2})[\s.\．、:：]/);
+  if (!m) return false;
+  const idx = parseInt(m[1], 10) - 1;
+  const bulk = findLatestBulkByThreadTs(channel, thread_ts);
+  if (idx < 0 || idx >= bulk.length) return false;
+  const target = bulk[idx];
+  const rest = text.slice(m[0].length).trim();
+  if (!rest) return false;
+
+  // Cancel
+  if (/(キャンセル|取消|やめ|削除|消して|消す|消去)/.test(rest)) {
+    cancelReminder(target.id);
+    await client.chat.postMessage({
+      channel, thread_ts,
+      text: `❌ ⌗${idx + 1} 「${target.task}」をキャンセルしました。`,
+    });
+    if (target.confirmation_message_ts) {
+      await refreshBulkMessage(client, channel, target.confirmation_message_ts);
+    }
+    return true;
+  }
+
+  // Restore (cancelled → draft + auto-approve)
+  if (/(復活|再登録|やっぱり|戻して)/.test(rest) && target.status === 'cancelled') {
+    restoreReminder(target.id);
+    approveReminder(target.id);
+    await client.chat.postMessage({
+      channel, thread_ts,
+      text: `♻️ ⌗${idx + 1} 「${target.task}」を再登録しました。`,
+    });
+    if (target.confirmation_message_ts) {
+      await refreshBulkMessage(client, channel, target.confirmation_message_ts);
+    }
+    return true;
+  }
+
+  // Approve
+  if (/(確定|OK|承認|登録)/.test(rest) && target.status === 'draft') {
+    approveReminder(target.id);
+    await client.chat.postMessage({
+      channel, thread_ts,
+      text: `✅ ⌗${idx + 1} 「${target.task}」を確定しました。`,
+    });
+    if (target.confirmation_message_ts) {
+      await refreshBulkMessage(client, channel, target.confirmation_message_ts);
+    }
+    return true;
+  }
+
+  // Modification (assignee / due_at via AI)
+  let mod;
+  try {
+    mod = await extractModification(rest, target);
+  } catch (err) {
+    console.error('[thread] numbered extractModification error:', err.message);
+    return true;
+  }
+  if (!mod?.action) return true;  // consumed the prefix, no clear modification
+
+  if (mod.action === 'modify' && ['draft', 'pending'].includes(target.status)) {
+    let assigneeSlackUserId = target.assignee_slack_user_id;
+    let assigneeName = target.assignee_name;
+    if (mod.assignee) {
+      const am = mod.assignee.match(/^<@(U[A-Z0-9]+)>$/) || mod.assignee.match(/^(U[A-Z0-9]{6,})$/);
+      if (am) { assigneeSlackUserId = am[1]; assigneeName = `<@${am[1]}>`; }
+      else    { assigneeName = mod.assignee; assigneeSlackUserId = null; }
+    }
+    updateReminder(target.id, {
+      assigneeName:        mod.assignee ? assigneeName        : undefined,
+      assigneeSlackUserId: mod.assignee ? assigneeSlackUserId : undefined,
+      dueAt:               mod.due_at || undefined,
+    });
+    const updatedAssignee = await silentAssigneeDisplay(client, assigneeSlackUserId, assigneeName);
+    const updatedDue = mod.due_at ? formatDueAt(mod.due_at) : formatDueAt(target.due_at);
+    await client.chat.postMessage({
+      channel, thread_ts,
+      text: `✏️ ⌗${idx + 1} を修正しました。\n*担当：* ${updatedAssignee}　*期限：* ${updatedDue}`,
+    });
+    if (target.confirmation_message_ts) {
+      await refreshBulkMessage(client, channel, target.confirmation_message_ts);
+    }
+  }
+  return true;
 }
 
 function markThreadEngaged(channel, thread_ts) {
