@@ -118,6 +118,14 @@ function findByConfirmationTs(channelId, messageTs) {
   `).get(channelId, messageTs);
 }
 
+function findAllByConfirmationTs(channelId, messageTs) {
+  return db.prepare(`
+    SELECT * FROM reminders
+    WHERE source_channel_id = ? AND confirmation_message_ts = ?
+    ORDER BY created_at ASC
+  `).all(channelId, messageTs);
+}
+
 function approveReminder(id) {
   db.prepare(`UPDATE reminders SET status = 'pending', updated_at = ? WHERE id = ? AND status = 'draft'`)
     .run(new Date().toISOString(), id);
@@ -236,6 +244,7 @@ module.exports = {
   setNotificationTarget,
   setConfirmationTs,
   findByConfirmationTs,
+  findAllByConfirmationTs,
   approveReminder,
   cancelReminder,
   restoreReminder,
