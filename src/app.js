@@ -2,12 +2,12 @@ require('dotenv').config();
 
 const { App, LogLevel } = require('@slack/bolt');
 const botConfig = require('./botConfig');
-const { handleMention, notificationTargetBlock, handlePassiveDetection, handleBotJoinedChannel } = require('./handlers/mention');
+const { handleMention, notificationTargetBlock, handlePassiveDetection, handleBotJoinedChannel, bulkConfirmBlocks } = require('./handlers/mention');
 const { handleReaction } = require('./handlers/reaction');
 const { startScheduler } = require('./scheduler');
 
 const { handleThreadReply } = require('./handlers/thread');
-const { setSetting, setNotificationTarget, findByConfirmationTs } = require('./db');
+const { setSetting, setNotificationTarget, findByConfirmationTs, findAllByConfirmationTs, approveReminder, cancelReminder } = require('./db');
 const { formatHours } = require('./utils');
 
 // Validate required environment variables at startup
@@ -62,6 +62,60 @@ app.action(/^set_advance_notice_hours__\d+$/, async ({ body, ack, client }) => {
       },
     ],
   });
+});
+
+// ── Bulk draft confirm/cancel ──────────────────────────────────────────────────
+// Rebuilds the bulk confirmation Block Kit message from current DB state.
+async function refreshBulkMessage(client, channel, ts) {
+  const reminders = findAllByConfirmationTs(channel, ts);
+  if (reminders.length === 0) return;
+  const { silentAssigneeDisplay, computeAdvanceNoticeHours } = require('./utils');
+  const entries = await Promise.all(reminders.map(async (r, i) => ({
+    id: r.id,
+    index: i + 1,
+    task: r.task,
+    assigneeDisplay: await silentAssigneeDisplay(client, r.assignee_slack_user_id, r.assignee_name),
+    dueAt: r.due_at,
+    hasDefaultDue: false,
+    advanceNoticeHours: r.advance_notice_hours,
+    _status: r.status === 'pending' ? 'pending' : r.status === 'cancelled' ? 'cancelled' : 'draft',
+  })));
+  const blocks = bulkConfirmBlocks(entries);
+  const draftCount = entries.filter(e => e._status === 'draft').length;
+  const headerText = draftCount > 0
+    ? `📋 ${entries.length} 件のリマインド候補。${draftCount} 件未確定。`
+    : `📋 ${entries.length} 件のリマインドを処理しました。`;
+  await client.chat.update({ channel, ts, text: headerText, blocks });
+}
+
+app.action('bulk_approve_one', async ({ body, ack, client }) => {
+  await ack();
+  approveReminder(body.actions[0].value);
+  await refreshBulkMessage(client, body.channel.id, body.message.ts);
+});
+
+app.action('bulk_cancel_one', async ({ body, ack, client }) => {
+  await ack();
+  cancelReminder(body.actions[0].value);
+  await refreshBulkMessage(client, body.channel.id, body.message.ts);
+});
+
+app.action('bulk_approve_all', async ({ body, ack, client }) => {
+  await ack();
+  try {
+    const ids = JSON.parse(body.actions[0].value);
+    for (const id of ids) approveReminder(id);
+  } catch (e) { console.error('[bulk_approve_all] parse failed:', e.message); }
+  await refreshBulkMessage(client, body.channel.id, body.message.ts);
+});
+
+app.action('bulk_cancel_all', async ({ body, ack, client }) => {
+  await ack();
+  try {
+    const ids = JSON.parse(body.actions[0].value);
+    for (const id of ids) cancelReminder(id);
+  } catch (e) { console.error('[bulk_cancel_all] parse failed:', e.message); }
+  await refreshBulkMessage(client, body.channel.id, body.message.ts);
 });
 
 // Action handler: notification target toggle (DM ↔ スレッド)
