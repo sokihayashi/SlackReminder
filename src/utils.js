@@ -31,6 +31,29 @@ function formatHours(hours) {
   return `${hours}時間`;
 }
 
+/**
+ * Smart advance-notice timing based on how far away the deadline is.
+ * Research-backed heuristics: short tasks benefit from last-minute reminders,
+ * long tasks from "the day before" reminders.
+ *   ≤6h    → 1h前
+ *   ≤24h   → 6h前
+ *   ≤72h   → 24h前 (前日)
+ *   ≤168h  → 48h前 (2日前)
+ *   >168h  → 168h前 (1週間前)
+ */
+function computeAdvanceNoticeHours(dueAt, createdAt = new Date()) {
+  if (!dueAt) return null;
+  const due = new Date(dueAt);
+  if (isNaN(due.getTime())) return null;
+  const totalHours = (due.getTime() - createdAt.getTime()) / 3600000;
+  if (totalHours <= 0) return null;
+  if (totalHours <= 6) return 1;
+  if (totalHours <= 24) return 6;
+  if (totalHours <= 72) return 24;
+  if (totalHours <= 168) return 48;
+  return 168;
+}
+
 function displayAssignee(reminder) {
   if (reminder.assignee_slack_user_id) return `<@${reminder.assignee_slack_user_id}>`;
   return reminder.assignee_name || '(担当者未設定)';
@@ -67,7 +90,7 @@ async function silentDisplayAssignee(client, reminder) {
 }
 
 module.exports = {
-  formatDueAt, formatJST, formatHours, displayAssignee,
+  formatDueAt, formatJST, formatHours, computeAdvanceNoticeHours, displayAssignee,
   getDisplayName, silentAssigneeDisplay, silentDisplayAssignee,
   CONFIDENCE_THRESHOLD, DEFAULT_ADVANCE_NOTICE_HOURS,
 };
