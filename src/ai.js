@@ -34,17 +34,28 @@ const VALID_INTENTS = [
   'show_settings', 'extract_from_thread', 'none',
 ];
 
+function sanitizeTask(t) {
+  if (!t || typeof t !== 'object') return null;
+  if (typeof t.task !== 'string' || !t.task.trim()) return null;
+  return {
+    task: t.task.trim(),
+    assignee: t.assignee ?? null,
+    due_at: t.due_at ?? null,
+    advance_notice_hours: Number.isFinite(t.advance_notice_hours) ? t.advance_notice_hours : null,
+    confidence: typeof t.confidence === 'number' ? t.confidence : 1,
+  };
+}
+
 function sanitizeExtraction(raw) {
+  const tasks = Array.isArray(raw.tasks)
+    ? raw.tasks.map(sanitizeTask).filter(Boolean)
+    : [];
   return {
     intent:               VALID_INTENTS.includes(raw.intent) ? raw.intent : 'none',
-    should_create_reminder: raw.should_create_reminder === true,
-    assignee:             raw.assignee            ?? null,
-    task:                 raw.task                ?? null,
-    due_at:               raw.due_at              ?? null,
+    tasks,
     confidence:           typeof raw.confidence === 'number' ? raw.confidence : 0,
     missing_fields:       Array.isArray(raw.missing_fields) ? raw.missing_fields : [],
     reason:               raw.reason              ?? null,
-    advance_notice_hours: Number.isFinite(raw.advance_notice_hours) ? raw.advance_notice_hours : null,
     notification_target:  raw.notification_target === 'thread' ? 'thread' : 'dm',
     channel_scope:        raw.channel_scope === 'all' ? 'all' : 'current',
     query_assignee:       raw.query_assignee      ?? null,
@@ -81,16 +92,19 @@ Today's date and time (JST): ${jstNow}.${threadSection}
 Determine the user's intent, then extract fields accordingly.
 
 Intent options:
-- "create_reminder": user wants to set a new reminder
-  → The user message has been pre-processed: the bot's own mention is already stripped
-  → Any <@UXXXXXXX> remaining in the message is the assignee (a human, never the bot itself)
-  → If no <@UXXXXXXX> in the message, try to infer the assignee from thread context
-  → Never use the bot as the assignee. If no human assignee can be determined, add "assignee" to missing_fields and set assignee=null
+- "create_reminder": user wants to register one or more reminders
+  → Populate the "tasks" array. Each entry is ONE distinct action item.
+  → If the user message contains multiple verbs/requests, decompose into separate entries.
+    Example: 「Aを借りて、Bを確保して、Cを確認して」 → 3 entries
+    Example: 「QKからインカム借りて、段ボール確保、15日に制作チームに確認」 → 3 entries
+  → If the user message lacks task details (e.g. just 「登録して」「リマインドして」「お願い」), look at Thread context above and extract action items discussed there.
+  → The user's bot mention is already stripped. Any remaining <@UXXXXXXX> is the assignee (a human, never the bot itself).
+  → Per-task assignee resolution: prefer <@UXXX> mentioned with the task; fall back to thread context. Never use the bot.
+  → If a task lacks a clear human assignee, leave assignee=null and add "assignee" to missing_fields (overall).
   → Interpret relative dates (明日, 来週, 今週中) from JST time above; default time 10:00 JST
   → "前日にリマインド" → subtract one day from due_at
   → Ambiguous date → confidence < 0.6, add "due_at" to missing_fields
-  → No clear assignee → add "assignee" to missing_fields
-  → "X日前に通知" or "X時間前に通知" in the message → set advance_notice_hours accordingly
+  → "X日前に通知" or "X時間前に通知" → set advance_notice_hours on that task
   → "このスレッドに通知" / "チャンネルで通知" / "DMじゃなく" / "ここに通知" → notification_target: "thread"
   → default notification_target: "dm"
   → due_at must be ISO 8601 with JST offset, e.g. "2026-05-20T10:00:00+09:00"
@@ -117,20 +131,18 @@ Intent options:
 
 Respond with JSON:
 - intent: "create_reminder" | "query_tasks" | "cancel_reminder" | "update_setting" | "set_summary_channel" | "remove_summary_channel" | "show_settings" | "extract_from_thread" | "none"
+- tasks: array of { task: string, assignee: string|null, due_at: string|null, advance_notice_hours: integer|null, confidence: number 0.0-1.0 }
+  → Empty array [] if intent is not create_reminder, or if no action item is found.
+  → For create_reminder, ALWAYS populate at least one entry when the user clearly asks to register a task.
 - cancel_assignee: string or null
 - cancel_task_hint: string or null
 - query_assignee: string or null
 - setting_key: string or null
 - setting_value: string or null
-- should_create_reminder: true if intent is create_reminder, else false
-- assignee: string or null
-- task: string or null
-- due_at: string or null
-- advance_notice_hours: integer or null (per-reminder override; null = use global default)
 - notification_target: "dm" | "thread"
 - channel_scope: "current" | "all"
-- confidence: number 0.0-1.0
-- missing_fields: array of strings
+- confidence: number 0.0-1.0 (overall extraction confidence)
+- missing_fields: array of strings (overall; e.g. ["assignee"] if no task has a clear assignee)
 - reason: string or null`,
       },
       { role: 'user', content: text },
