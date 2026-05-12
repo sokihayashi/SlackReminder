@@ -958,7 +958,7 @@ async function handleReset(channel, replyThreadTs, client, code) {
     blocks: [
       {
         type: 'section',
-        text: { type: 'mrkdwn', text: `⚠️ *RESET 確認*\n\n以下を全削除します（**元に戻せません**）:\n• DB のリマインド: *${count} 件*\n• \`pending_questions\` テーブル\n• bot がメンバーチャンネルに投稿した直近メッセージ（チャンネルあたり最新100件）\n\n_設定（事前通知時刻、サマリーチャンネル）は保持されます。_` },
+        text: { type: 'mrkdwn', text: `⚠️ *RESET 確認*\n\n以下を全削除します（**元に戻せません**）:\n• DB のリマインド: *${count} 件*\n• \`pending_questions\` テーブル\n• bot がメンバーチャンネルに投稿した過去メッセージ（最大5ページ＝1000件/ch）\n• bot から各ユーザーへ送った *DM* も全削除（リマインド通知含む）\n\n_設定（事前通知時刻、サマリーチャンネル）は保持されます。Slack API レートリミットの都合で時間がかかります。_` },
       },
       {
         type: 'actions',
@@ -971,46 +971,99 @@ async function handleReset(channel, replyThreadTs, client, code) {
   });
 }
 
+/**
+ * Delete all messages authored by the bot in a single conversation (channel or DM),
+ * paginating through history up to maxPages.
+ */
+async function deleteBotMessagesInConversation(client, channelId, maxPages = 5) {
+  let deleted = 0, errors = 0;
+  let cursor;
+  for (let page = 0; page < maxPages; page++) {
+    try {
+      const params = { channel: channelId, limit: 200 };
+      if (cursor) params.cursor = cursor;
+      const r = await client.conversations.history(params);
+      for (const m of (r.messages || [])) {
+        if (m.user === botConfig.botUserId) {
+          try {
+            await client.chat.delete({ channel: channelId, ts: m.ts });
+            deleted++;
+          } catch (e) {
+            errors++;
+          }
+        }
+      }
+      cursor = r.response_metadata?.next_cursor;
+      if (!cursor) break;
+    } catch (e) {
+      console.error(`[reset] history failed for ${channelId} page ${page}:`, e.message);
+      break;
+    }
+  }
+  return { deleted, errors };
+}
+
+async function listAllIMConversations(client) {
+  const ims = [];
+  let cursor;
+  for (let page = 0; page < 10; page++) {
+    try {
+      const params = { types: 'im', exclude_archived: true, limit: 200 };
+      if (cursor) params.cursor = cursor;
+      const r = await client.conversations.list(params);
+      for (const im of (r.channels || [])) ims.push(im);
+      cursor = r.response_metadata?.next_cursor;
+      if (!cursor) break;
+    } catch (e) {
+      console.error('[reset] conversations.list (im) failed:', e.message);
+      break;
+    }
+  }
+  return ims;
+}
+
 async function executeReset(client, channel, ts) {
   try {
-    await client.chat.update({ channel, ts, text: '🗑️ RESET 実行中… (Slack メッセージ削除に時間がかかる場合があります)' });
+    await client.chat.update({ channel, ts, text: '🗑️ RESET 実行中… (Slack メッセージ削除に時間がかかります)' });
   } catch (_) {}
 
   let slackDeleted = 0;
   let errors = 0;
 
-  // 1. Walk bot's member channels and delete bot's recent messages.
   if (botConfig.botUserId) {
+    // 1. Member channels (public + private the bot is in)
     try {
       const channels = await listBotMemberChannels(client);
+      console.log(`[reset] purging ${channels.length} member channels`);
       for (const ch of channels) {
-        try {
-          const history = await client.conversations.history({ channel: ch.id, limit: 100 });
-          for (const m of (history.messages || [])) {
-            if (m.user === botConfig.botUserId) {
-              try {
-                await client.chat.delete({ channel: ch.id, ts: m.ts });
-                slackDeleted++;
-              } catch (e) {
-                errors++;
-              }
-            }
-          }
-        } catch (e) {
-          console.error(`[reset] history failed for ${ch.id}:`, e.message);
-        }
+        const r = await deleteBotMessagesInConversation(client, ch.id, 5);
+        slackDeleted += r.deleted;
+        errors += r.errors;
       }
     } catch (e) {
-      console.error('[reset] listBotMemberChannels failed:', e.message);
+      console.error('[reset] member channel sweep failed:', e.message);
+    }
+
+    // 2. IM conversations (DMs) — reminder notifications, follow-up messages
+    try {
+      const ims = await listAllIMConversations(client);
+      console.log(`[reset] purging ${ims.length} IM conversations`);
+      for (const im of ims) {
+        const r = await deleteBotMessagesInConversation(client, im.id, 5);
+        slackDeleted += r.deleted;
+        errors += r.errors;
+      }
+    } catch (e) {
+      console.error('[reset] IM sweep failed:', e.message);
     }
   }
 
-  // 2. Wipe DB.
+  // 3. Wipe DB
   const wiped = wipeAll();
 
   await client.chat.postMessage({
     channel,
-    text: `✅ RESET 完了。DB ${wiped.reminders}件 / Slack ${slackDeleted}件 削除しました。${errors > 0 ? ` (削除エラー: ${errors}件)` : ''}`,
+    text: `✅ RESET 完了。\n• DB: リマインド ${wiped.reminders}件 / pending ${wiped.pending}件 削除\n• Slack: ${slackDeleted}件削除${errors > 0 ? `（削除エラー: ${errors}件 — 過去メッセージは 24h 経過しているなどで削除不能の場合あり）` : ''}`,
   });
 }
 
