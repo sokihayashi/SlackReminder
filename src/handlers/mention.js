@@ -4,7 +4,7 @@ const {
   getAllPending, getPendingByAssignee, cancelReminder,
   getSetting, setSetting, getAllSettings,
 } = require('../db');
-const { formatDueAt, formatHours, displayAssignee, CONFIDENCE_THRESHOLD, DEFAULT_ADVANCE_NOTICE_HOURS } = require('../utils');
+const { formatDueAt, formatHours, displayAssignee, silentAssigneeDisplay, silentDisplayAssignee, getDisplayName, CONFIDENCE_THRESHOLD, DEFAULT_ADVANCE_NOTICE_HOURS } = require('../utils');
 const botConfig = require('../botConfig');
 
 async function handleMention({ event, client }) {
@@ -73,7 +73,7 @@ async function handleMention({ event, client }) {
     });
 
     const dueDisplay = formatDueAt(extraction.due_at);
-    const assigneeDisplay = assigneeSlackUserId ? `<@${assigneeSlackUserId}>` : assigneeName;
+    const assigneeDisplay = await silentAssigneeDisplay(client, assigneeSlackUserId, assigneeName);
     const noticeHours = extraction.advance_notice_hours
       ?? parseInt(getSetting('advance_notice_hours', String(DEFAULT_ADVANCE_NOTICE_HOURS)), 10);
     const noticeLabel = formatHours(noticeHours);
@@ -116,12 +116,16 @@ async function handleMention({ event, client }) {
   }
 }
 
-// ── Intent handlers ───────────────────────────────────────────────────────────
+// ── Intent handlers ──────────────────────────────────────────────────────────────
 
 async function handleTaskQuery(extraction, channel, replyThreadTs, client) {
   const queryUserId = extractUserId(extraction.query_assignee);
   const reminders = queryUserId ? getPendingByAssignee(queryUserId) : getAllPending();
-  const headerText = queryUserId ? `<@${queryUserId}> のタスク一覧` : 'ペンディングタスク一覧';
+  let headerText = 'ペンディングタスク一覧';
+  if (queryUserId) {
+    const name = await getDisplayName(client, queryUserId);
+    headerText = `${name ? `@${name}` : 'ユーザー'} のタスク一覧`;
+  }
 
   if (reminders.length === 0) {
     await client.chat.postMessage({
@@ -132,11 +136,11 @@ async function handleTaskQuery(extraction, channel, replyThreadTs, client) {
     return;
   }
 
-  const lines = reminders.map((r, i) => {
-    const assignee = displayAssignee(r);
+  const lines = await Promise.all(reminders.map(async (r, i) => {
+    const assignee = await silentDisplayAssignee(client, r);
     const statusLabel = r.status === 'draft' ? '未確認' : '確認済み';
     return `${i + 1}. *${r.task}*\n　担当：${assignee}　期限：${formatDueAt(r.due_at)}　[${statusLabel}]`;
-  });
+  }));
 
   await client.chat.postMessage({
     channel,
@@ -181,7 +185,7 @@ async function cancelOne(reminderId, pending, channel, replyThreadTs, client) {
   if (!r) return showAmbiguousList(pending, channel, replyThreadTs, client);
 
   cancelReminder(r.id);
-  const assignee = displayAssignee(r);
+  const assignee = await silentDisplayAssignee(client, r);
   await client.chat.postMessage({
     channel,
     thread_ts: replyThreadTs,
@@ -201,7 +205,13 @@ async function cancelByAssignee(assigneeFilter, pending, channel, replyThreadTs,
   if (matched.length === 0) return showAmbiguousList(pending, channel, replyThreadTs, client);
 
   for (const r of matched) cancelReminder(r.id);
-  const label = assigneeId ? `<@${assigneeId}>` : assigneeFilter;
+  let label;
+  if (assigneeId) {
+    const name = await getDisplayName(client, assigneeId);
+    label = name ? `@${name}` : assigneeFilter;
+  } else {
+    label = assigneeFilter;
+  }
   await client.chat.postMessage({
     channel,
     thread_ts: replyThreadTs,
@@ -210,10 +220,10 @@ async function cancelByAssignee(assigneeFilter, pending, channel, replyThreadTs,
 }
 
 async function showAmbiguousList(pending, channel, replyThreadTs, client) {
-  const lines = pending.map((r, i) => {
-    const assignee = displayAssignee(r);
+  const lines = await Promise.all(pending.map(async (r, i) => {
+    const assignee = await silentDisplayAssignee(client, r);
     return `${i + 1}. *${r.task}*　担当：${assignee}　期限：${formatDueAt(r.due_at)}`;
-  });
+  }));
   await client.chat.postMessage({
     channel,
     thread_ts: replyThreadTs,
@@ -395,7 +405,7 @@ async function postHelp(channel, replyThreadTs, client) {
   });
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────────────
 
 async function fetchThreadContext(client, channel, thread_ts, currentTs) {
   if (!thread_ts) return [];

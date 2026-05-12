@@ -1,6 +1,6 @@
 const { extractModification } = require('../ai');
 const { findByThreadTs, updateReminder, restoreReminder, approveReminder } = require('../db');
-const { formatDueAt, displayAssignee } = require('../utils');
+const { formatDueAt, silentDisplayAssignee, silentAssigneeDisplay } = require('../utils');
 
 async function handleThreadReply({ message, client }) {
   const { text, channel, thread_ts } = message;
@@ -21,7 +21,7 @@ async function handleThreadReply({ message, client }) {
   if (mod.action === 'restore' && reminder.status === 'cancelled') {
     restoreReminder(reminder.id);
     approveReminder(reminder.id);
-    const assigneeDisplay = displayAssignee(reminder);
+    const assigneeDisplay = await silentDisplayAssignee(client, reminder);
     await client.chat.postMessage({
       channel,
       thread_ts,
@@ -51,7 +51,7 @@ async function handleThreadReply({ message, client }) {
       dueAt: mod.due_at || undefined,
     });
 
-    const updatedAssignee = assigneeSlackUserId ? `<@${assigneeSlackUserId}>` : assigneeName;
+    const updatedAssignee = await silentAssigneeDisplay(client, assigneeSlackUserId, assigneeName);
     const updatedDue = mod.due_at ? formatDueAt(mod.due_at) : formatDueAt(reminder.due_at);
 
     await client.chat.postMessage({

@@ -1,6 +1,6 @@
 const cron = require('node-cron');
 const { getPendingDueReminders, getUnnotifiedPendingReminders, getAllPending, markSent, markFailed, markAdvanceNotified, getSetting, setSetting } = require('./db');
-const { formatDueAt, formatHours, displayAssignee, DEFAULT_ADVANCE_NOTICE_HOURS } = require('./utils');
+const { formatDueAt, formatHours, displayAssignee, silentDisplayAssignee, DEFAULT_ADVANCE_NOTICE_HOURS } = require('./utils');
 
 const UNRECOVERABLE_CODES = ['user_not_found', 'user_disabled', 'account_inactive', 'no_such_channel'];
 function isUnrecoverable(err) {
@@ -114,11 +114,11 @@ async function postWeeklySummary(client) {
     return;
   }
 
-  const lines = reminders.map((r, i) => {
-    const assignee = displayAssignee(r);
+  const lines = await Promise.all(reminders.map(async (r, i) => {
+    const assignee = await silentDisplayAssignee(client, r);
     const statusLabel = r.status === 'draft' ? '⏳未確認' : '✅確認済み';
     return `${i + 1}. *${r.task}*\n　担当：${assignee}　期限：${formatDueAt(r.due_at)}　${statusLabel}`;
-  });
+  }));
 
   try {
     await client.chat.postMessage({
