@@ -8,15 +8,15 @@ const {
 const { formatDueAt, formatHours, displayAssignee, silentAssigneeDisplay, silentDisplayAssignee, getDisplayName, CONFIDENCE_THRESHOLD, DEFAULT_ADVANCE_NOTICE_HOURS } = require('../utils');
 const botConfig = require('../botConfig');
 
-async function handleMention({ event, client, priorText = null }) {
+async function handleMention({ event, client, priorText = null, silentOnNone = false }) {
   const { text, channel, ts, thread_ts, user } = event;
   const replyThreadTs = thread_ts || ts;
 
-  console.log(`[mention] user=${user} channel=${channel}${priorText ? ' (follow-up)' : ''}`);
+  console.log(`[mention] user=${user} channel=${channel}${priorText ? ' (follow-up)' : ''}${silentOnNone ? ' (silent)' : ''}`);
 
   try {
-    // Fast-path: keyword match before calling AI (only for first-turn)
-    if (!priorText) {
+    // Fast-path: keyword match before calling AI (only for first-turn, only on explicit mention)
+    if (!priorText && !silentOnNone) {
       const bare = text.replace(/<@[^>]+>/g, '').trim();
       if (/^(ヘルプ|help|使い方|つかいかた)\??$/i.test(bare)) {
         await postHelp(channel, replyThreadTs, client);
@@ -53,6 +53,7 @@ async function handleMention({ event, client, priorText = null }) {
     }
 
     if (extraction.intent !== 'create_reminder' || extraction.tasks.length === 0) {
+      if (silentOnNone) return;
       await client.chat.postMessage({
         channel,
         thread_ts: replyThreadTs,
@@ -90,6 +91,7 @@ async function handleMention({ event, client, priorText = null }) {
     return postBulkCreate(extraction.tasks, notifTarget, channel, ts, replyThreadTs, user, client);
   } catch (err) {
     console.error('[mention] Error:', err);
+    if (silentOnNone) return;
     await client.chat.postMessage({
       channel,
       thread_ts: replyThreadTs,
