@@ -442,6 +442,12 @@ function bulkConfirmBlocks(entries) {
             value: e.id,
             action_id: 'bulk_cancel_one',
           },
+          {
+            type: 'button',
+            text: { type: 'plain_text', text: `✏️ 修正` },
+            value: e.id,
+            action_id: 'bulk_modify_one',
+          },
         ],
       });
     }
@@ -474,7 +480,7 @@ function bulkConfirmBlocks(entries) {
 
   blocks.push({
     type: 'context',
-    elements: [{ type: 'mrkdwn', text: '_個別修正はスレッドに「⌗1 の期限を 明日 17時 に」のように番号付きで返信_' }],
+    elements: [{ type: 'mrkdwn', text: '_✏️ 修正ボタンで担当者・期限・事前通知を変更できます。スレッド返信でも可: 「⌗1 の期限を 明日 17時 に」_' }],
   });
 
   return blocks;

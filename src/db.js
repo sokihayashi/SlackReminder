@@ -216,13 +216,18 @@ function findByThreadTs(channelId, threadTs) {
   `).get(channelId, threadTs);
 }
 
-function updateReminder(id, { assigneeName, assigneeSlackUserId, dueAt } = {}) {
+function getReminderById(id) {
+  return db.prepare(`SELECT * FROM reminders WHERE id = ?`).get(id) ?? null;
+}
+
+function updateReminder(id, { assigneeName, assigneeSlackUserId, dueAt, advanceNoticeHours } = {}) {
   const now = new Date().toISOString();
   const fields = [];
   const values = [];
   if (assigneeName !== undefined)        { fields.push('assignee_name = ?');          values.push(assigneeName); }
   if (assigneeSlackUserId !== undefined)  { fields.push('assignee_slack_user_id = ?'); values.push(assigneeSlackUserId); }
   if (dueAt !== undefined)               { fields.push('due_at = ?');                 values.push(toUtcISO(dueAt)); }
+  if (advanceNoticeHours !== undefined)  { fields.push('advance_notice_hours = ?');   values.push(advanceNoticeHours); }
   if (fields.length === 0) return;
   fields.push('updated_at = ?');
   values.push(now, id);
@@ -327,6 +332,7 @@ module.exports = {
   getAllPending,
   getPendingByAssignee,
   findByThreadTs,
+  getReminderById,
   updateReminder,
   // pending questions
   savePendingQuestion,
