@@ -2,7 +2,7 @@ require('dotenv').config();
 
 const { App, LogLevel } = require('@slack/bolt');
 const botConfig = require('./botConfig');
-const { handleMention, notificationTargetBlock, handlePassiveDetection, handleBotJoinedChannel, bulkConfirmBlocks, refreshBulkMessage } = require('./handlers/mention');
+const { handleMention, notificationTargetBlock, handlePassiveDetection, handleBotJoinedChannel, bulkConfirmBlocks, refreshBulkMessage, executeReset } = require('./handlers/mention');
 const { handleReaction } = require('./handlers/reaction');
 const { startScheduler } = require('./scheduler');
 
@@ -94,6 +94,28 @@ app.action('bulk_cancel_all', async ({ body, ack, client }) => {
     for (const id of ids) cancelReminder(id);
   } catch (e) { console.error('[bulk_cancel_all] parse failed:', e.message); }
   await refreshBulkMessage(client, body.channel.id, body.message.ts);
+});
+
+// Admin RESET confirmation
+app.action('reset_confirm', async ({ body, ack, client }) => {
+  await ack();
+  try {
+    await client.chat.update({
+      channel: body.channel.id, ts: body.message.ts,
+      text: '🗑️ RESET 実行中…',
+      blocks: [{ type: 'section', text: { type: 'mrkdwn', text: '🗑️ RESET 実行中…' } }],
+    });
+  } catch (_) {}
+  await executeReset(client, body.channel.id, body.message.ts);
+});
+
+app.action('reset_cancel', async ({ body, ack, client }) => {
+  await ack();
+  await client.chat.update({
+    channel: body.channel.id, ts: body.message.ts,
+    text: 'RESET を中止しました。',
+    blocks: [{ type: 'section', text: { type: 'mrkdwn', text: '🚫 RESET を中止しました。' } }],
+  });
 });
 
 // Quick due-at buttons posted when AI extraction is missing due_at
