@@ -984,12 +984,39 @@ async function deleteBotMessagesInConversation(client, channelId, maxPages = 5) 
       if (cursor) params.cursor = cursor;
       const r = await client.conversations.history(params);
       for (const m of (r.messages || [])) {
-        if (m.user === botConfig.botUserId) {
+        // Delete top-level bot message
+        if (m.user === botConfig.botUserId || m.bot_id) {
           try {
             await client.chat.delete({ channel: channelId, ts: m.ts });
             deleted++;
           } catch (e) {
             errors++;
+          }
+        }
+        // Also delete bot's replies inside any thread
+        if (m.reply_count > 0 && m.thread_ts === m.ts) {
+          try {
+            let replyCursor;
+            for (let rPage = 0; rPage < 3; rPage++) {
+              const rParams = { channel: channelId, ts: m.ts, limit: 100 };
+              if (replyCursor) rParams.cursor = replyCursor;
+              const rr = await client.conversations.replies(rParams);
+              for (const reply of (rr.messages || [])) {
+                if (reply.ts === m.ts) continue; // skip thread parent (already handled above)
+                if (reply.user === botConfig.botUserId || reply.bot_id) {
+                  try {
+                    await client.chat.delete({ channel: channelId, ts: reply.ts });
+                    deleted++;
+                  } catch (e) {
+                    errors++;
+                  }
+                }
+              }
+              replyCursor = rr.response_metadata?.next_cursor;
+              if (!replyCursor) break;
+            }
+          } catch (e) {
+            // conversations.replies may fail in DMs or private channels; skip silently
           }
         }
       }
