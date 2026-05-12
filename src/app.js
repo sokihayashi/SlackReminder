@@ -114,6 +114,6 @@ app.message(async ({ message, client }) => {
   startScheduler(app.client);
 
   console.log(
-    `Slack Reminder Bot is running (mode: ${useSocketMode ? 'Socket' : 'HTTP'}, botUserId: ${user_id})`
+    `Slack Reminder Bot is running (mode: ${useSocketMode ? 'Socket' : 'HTTP'}, botUserId: ${user_id}, commit: ${botConfig.commitHash}, runId: ${botConfig.runId}, started: ${botConfig.startTime})`
   );
 })();

@@ -653,7 +653,8 @@ function scopeHintForError(err) {
 }
 
 async function runDiagnostics(channel, replyThreadTs, client) {
-  const lines = ['🔧 *セルフ診断レポート*\n'];
+  const ver = `commit: \`${botConfig.commitHash}\` | run: \`${botConfig.runId}\` | 起動: ${botConfig.startTime}`;
+  const lines = [`🔧 *セルフ診断レポート*\n${ver}\n`];
 
   // 1. auth.test
   let botUserId = null;

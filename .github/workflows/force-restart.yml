@@ -11,16 +11,42 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.PAT }}
         run: |
+          echo "=== Cancelling in_progress and queued bot.yml runs ==="
           for status in in_progress queued; do
-            gh run list --workflow=bot.yml --status=$status \
+            ids=$(gh run list --workflow=bot.yml --status=$status \
               --json databaseId --jq '.[].databaseId' \
-              | xargs -r -I {} gh run cancel {} --repo ${{ github.repository }} || true
+              --repo ${{ github.repository }})
+            if [ -z "$ids" ]; then
+              echo "No $status runs found."
+            else
+              echo "Found $status runs: $ids"
+              echo "$ids" | xargs -I {} sh -c \
+                'gh run cancel {} --repo ${{ github.repository }} && echo "Cancelled run {}" || echo "Failed to cancel run {}"'
+            fi
           done
 
       - name: Wait for cancellation to settle
-        run: sleep 15
+        run: |
+          echo "Waiting 20 seconds for cancellations to complete..."
+          sleep 20
+          echo "=== Remaining bot.yml runs ==="
+          gh run list --workflow=bot.yml --limit 5 \
+            --json databaseId,status,conclusion \
+            --repo ${{ github.repository }} \
+            --jq '.[] | "\(.databaseId) \(.status) \(.conclusion)"'
+        env:
+          GH_TOKEN: ${{ secrets.PAT }}
 
       - name: Start fresh bot run
         env:
           GH_TOKEN: ${{ secrets.PAT }}
-        run: gh workflow run bot.yml --repo ${{ github.repository }}
+        run: |
+          echo "Triggering new bot.yml run on default branch..."
+          gh workflow run bot.yml --repo ${{ github.repository }}
+          echo "Waiting 10 seconds for run to appear..."
+          sleep 10
+          echo "=== Newly queued/running bot.yml runs ==="
+          gh run list --workflow=bot.yml --limit 3 \
+            --json databaseId,status,headSha \
+            --repo ${{ github.repository }} \
+            --jq '.[] | "run=\(.databaseId) status=\(.status) sha=\(.headSha[0:7])"'
