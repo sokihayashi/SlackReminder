@@ -22,6 +22,10 @@ async function handleMention({ event, client, priorText = null }) {
         await postHelp(channel, replyThreadTs, client);
         return;
       }
+      if (/^(診断|debug|diagnos[ei]s|scope確認|セルフチェック)\??$/i.test(bare)) {
+        await runDiagnostics(channel, replyThreadTs, client);
+        return;
+      }
     }
 
     const threadMessages = await fetchThreadContext(client, channel, thread_ts, ts);
@@ -385,7 +389,7 @@ async function handleExtractFromAllChannels(originChannel, replyThreadTs, curren
   if (channels.length === 0) {
     await client.chat.postMessage({
       channel: originChannel, thread_ts: replyThreadTs,
-      text: 'スキャン対象のチャンネルが見つかりませんでした。bot がメンバーになっているチャンネルがあるか確認してください。',
+      text: 'スキャン対象のチャンネルが見つかりませんでした。`@Reminder Bot 診断` でスコープ／メンバー状態を確認してください。',
     });
     return;
   }
@@ -597,7 +601,7 @@ async function postHelp(channel, replyThreadTs, client) {
         type: 'section',
         text: {
           type: 'mrkdwn',
-          text: '*設定*\n```@Reminder Bot 設定確認\n@Reminder Bot 設定: 事前通知 2日前\n@Reminder Bot このチャンネルにタスクサマリーを設定\n@Reminder Bot サマリーを解除```',
+          text: '*設定・診断*\n```@Reminder Bot 設定確認\n@Reminder Bot 設定: 事前通知 2日前\n@Reminder Bot このチャンネルにタスクサマリーを設定\n@Reminder Bot サマリーを解除\n@Reminder Bot 診断   ← スコープ・チャンネルメンバー状態を確認```',
         },
       },
       {
@@ -610,6 +614,98 @@ async function postHelp(channel, replyThreadTs, client) {
         ],
       },
     ],
+  });
+}
+
+// ── Diagnostics ─────────────────────────────────────────────────────────────────
+
+/**
+ * Map Slack API error codes to the scope likely missing.
+ */
+function scopeHintForError(err) {
+  const code = err?.data?.error || err?.code || err?.message || '';
+  if (code.includes('missing_scope')) {
+    const needed = err?.data?.needed;
+    return needed ? `不足scope: \`${needed}\`` : '不足scope（needed情報なし）';
+  }
+  if (code.includes('not_in_channel')) return 'bot がそのチャンネルに招待されていません';
+  if (code.includes('channel_not_found')) return 'チャンネルIDが無効、または bot から見えない（プライベートで未招待）';
+  if (code.includes('account_inactive')) return 'bot ユーザーが無効化されています';
+  return `エラー: \`${code}\``;
+}
+
+async function runDiagnostics(channel, replyThreadTs, client) {
+  const lines = ['🔧 *セルフ診断レポート*\n'];
+
+  // 1. auth.test
+  let botUserId = null;
+  try {
+    const auth = await client.auth.test();
+    botUserId = auth.user_id;
+    lines.push(`✅ *認証* OK — bot user: \`${auth.user}\` (\`${auth.user_id}\`), team: \`${auth.team}\``);
+  } catch (e) {
+    lines.push(`❌ *認証* 失敗 — ${scopeHintForError(e)}`);
+    await client.chat.postMessage({ channel, thread_ts: replyThreadTs, text: lines.join('\n') });
+    return;
+  }
+
+  // 2. public_channel list
+  let publicCount = null;
+  try {
+    const r = await client.conversations.list({ types: 'public_channel', exclude_archived: true, limit: 200 });
+    publicCount = (r.channels || []).filter(c => c.is_member).length;
+    lines.push(`✅ *channels:read* OK — bot がメンバーの public channel: *${publicCount} 個*`);
+  } catch (e) {
+    lines.push(`❌ *channels:read* 失敗 — ${scopeHintForError(e)}\n  → Slack アプリ設定で \`channels:read\` を追加して再インストール`);
+  }
+
+  // 3. private_channel list
+  let privateCount = null;
+  try {
+    const r = await client.conversations.list({ types: 'private_channel', exclude_archived: true, limit: 200 });
+    privateCount = (r.channels || []).filter(c => c.is_member).length;
+    lines.push(`✅ *groups:read* OK — bot がメンバーの private channel: *${privateCount} 個*`);
+  } catch (e) {
+    lines.push(`❌ *groups:read* 失敗 — ${scopeHintForError(e)}\n  → プライベートチャンネルを扱うなら \`groups:read\` を追加して再インストール`);
+  }
+
+  // 4. users.conversations (alternative listing — bot's own membership)
+  let userConvCount = null;
+  if (botUserId) {
+    try {
+      const r = await client.users.conversations({ user: botUserId, types: 'public_channel,private_channel', exclude_archived: true, limit: 200 });
+      userConvCount = (r.channels || []).length;
+      lines.push(`✅ *users.conversations* OK — \`${botUserId}\` 視点でのメンバー: *${userConvCount} 個*`);
+    } catch (e) {
+      lines.push(`⚠️ *users.conversations* 失敗 — ${scopeHintForError(e)}`);
+    }
+  }
+
+  // 5. history of current channel
+  try {
+    const r = await client.conversations.history({ channel, limit: 1 });
+    lines.push(`✅ *このチャンネルの history* OK — 取得可能（${r.messages?.length ?? 0}件サンプル）`);
+  } catch (e) {
+    const hint = scopeHintForError(e);
+    lines.push(`❌ *このチャンネルの history* 失敗 — ${hint}\n  → public なら \`channels:history\`、private なら \`groups:history\` を追加して再インストール`);
+  }
+
+  // 6. summary
+  const total = (publicCount ?? 0) + (privateCount ?? 0);
+  lines.push('');
+  if (total === 0 && (userConvCount === null || userConvCount === 0)) {
+    lines.push(`⚠️ bot がメンバーになっているチャンネルが0件です。原因の可能性:`);
+    lines.push(`  1. 後から追加した scope を反映するため *Reinstall to Workspace* が必要`);
+    lines.push(`  2. bot を実際にチャンネルに招待していない`);
+    lines.push(`  3. プライベートチャンネルのみで \`groups:read\` が未付与`);
+  } else {
+    lines.push(`📊 合計: *${total} チャンネル* で動作可能`);
+  }
+
+  await client.chat.postMessage({
+    channel,
+    thread_ts: replyThreadTs,
+    text: lines.join('\n'),
   });
 }
 
