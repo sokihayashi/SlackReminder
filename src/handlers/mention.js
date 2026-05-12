@@ -1,9 +1,9 @@
-const { extractReminder, resolveCancelTarget } = require('../ai');
+const { extractReminder, resolveCancelTarget, extractTasksFromThread } = require('../ai');
 const {
   createReminder, setConfirmationTs, setNotificationTarget,
-  getAllPending, getPendingByAssignee, cancelReminder,
+  getAllPending, getPendingByAssignee, cancelReminder, approveReminder,
   getSetting, setSetting, getAllSettings,
-  savePendingQuestion, deletePendingQuestion,
+  savePendingQuestion, deletePendingQuestion, findByThreadTs,
 } = require('../db');
 const { formatDueAt, formatHours, displayAssignee, silentAssigneeDisplay, silentDisplayAssignee, getDisplayName, CONFIDENCE_THRESHOLD, DEFAULT_ADVANCE_NOTICE_HOURS } = require('../utils');
 const botConfig = require('../botConfig');
@@ -41,6 +41,7 @@ async function handleMention({ event, client, priorText = null }) {
       case 'set_summary_channel':   return handleSetSummaryChannel(channel, replyThreadTs, client);
       case 'remove_summary_channel':return handleRemoveSummaryChannel(channel, replyThreadTs, client);
       case 'show_settings':         return handleShowSettings(channel, replyThreadTs, client);
+      case 'extract_from_thread':   return handleExtractFromThread(channel, thread_ts, replyThreadTs, ts, user, client);
     }
 
     if (!extraction.should_create_reminder) {
@@ -266,6 +267,90 @@ async function showAmbiguousList(pending, channel, replyThreadTs, client) {
   });
 }
 
+async function handleExtractFromThread(channel, threadTs, replyThreadTs, currentTs, user, client) {
+  const messages = threadTs
+    ? await fetchFullThread(client, channel, threadTs, currentTs)
+    : await fetchChannelHistory(client, channel, currentTs);
+
+  if (messages.length === 0) {
+    await client.chat.postMessage({
+      channel,
+      thread_ts: replyThreadTs,
+      text: threadTs ? 'スレッド内にメッセージが見つかりませんでした。' : 'チャンネルの履歴が見つかりませんでした。',
+    });
+    return;
+  }
+
+  const tasks = await extractTasksFromThread(messages, new Date(), botConfig.botUserId);
+  const filtered = tasks.filter(t => t.confidence >= 0.4);
+
+  if (filtered.length === 0) {
+    await client.chat.postMessage({
+      channel,
+      thread_ts: replyThreadTs,
+      text: threadTs ? 'スレッド内にタスクが見つかりませんでした。' : 'チャンネルの直近メッセージにタスクが見つかりませんでした。',
+    });
+    return;
+  }
+
+  const defaultDueAt = (() => {
+    const d = new Date();
+    d.setDate(d.getDate() + 7);
+    const jst = new Date(d.getTime() + 9 * 60 * 60 * 1000);
+    const y = jst.getUTCFullYear();
+    const mo = String(jst.getUTCMonth() + 1).padStart(2, '0');
+    const da = String(jst.getUTCDate()).padStart(2, '0');
+    return `${y}-${mo}-${da}T10:00:00+09:00`;
+  })();
+
+  const results = [];
+  for (const t of filtered) {
+    const { assigneeSlackUserId, assigneeName } = resolveAssignee(t.assignee);
+    const dueAt = t.due_at || defaultDueAt;
+    const hasDefaultDue = !t.due_at;
+    try {
+      const id = createReminder({
+        task: t.task,
+        assigneeName,
+        assigneeSlackUserId,
+        dueAt,
+        sourceChannelId: channel,
+        sourceMessageTs: currentTs,
+        sourceThreadTs: replyThreadTs,
+        createdBy: user,
+        confidence: t.confidence,
+        advanceNoticeHours: null,
+        notificationTarget: 'dm',
+      });
+      approveReminder(id);
+      const assigneeDisplay = await silentAssigneeDisplay(client, assigneeSlackUserId, assigneeName);
+      results.push({ task: t.task, assigneeDisplay, dueAt, hasDefaultDue, status: 'created' });
+    } catch (err) {
+      console.error('[extract_from_thread] createReminder error:', err.message);
+      results.push({ task: t.task, status: 'error' });
+    }
+  }
+
+  const created = results.filter(r => r.status === 'created');
+  if (created.length === 0) {
+    await client.chat.postMessage({ channel, thread_ts: replyThreadTs, text: 'タスクの登録に失敗しました。' });
+    return;
+  }
+
+  const lines = results.map((r, i) => {
+    if (r.status !== 'created') return `${i + 1}. ⚠️ 登録失敗: ${r.task}`;
+    const dueNote = r.hasDefaultDue ? '　_※期限未指定のため1週間後_' : '';
+    return `${i + 1}. ✅ *${r.task}*\n　　担当: ${r.assigneeDisplay}　期限: ${formatDueAt(r.dueAt)}${dueNote}`;
+  });
+
+  const scope = threadTs ? 'スレッド' : 'チャンネル';
+  await client.chat.postMessage({
+    channel,
+    thread_ts: replyThreadTs,
+    text: `📋 ${scope}から *${created.length} 件* のリマインドを登録しました。\n\n${lines.join('\n\n')}\n\n_キャンセルは「@Reminder Bot ○○のリマインドキャンセル」_`,
+  });
+}
+
 async function handleUpdateSetting(extraction, channel, replyThreadTs, client) {
   const { setting_key: key, setting_value: value } = extraction;
 
@@ -442,6 +527,39 @@ async function postHelp(channel, replyThreadTs, client) {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────────────
 
+async function fetchFullThread(client, channel, threadTs, currentTs) {
+  const botPattern = botConfig.botUserId ? new RegExp(`<@${botConfig.botUserId}>`, 'g') : null;
+  try {
+    const result = await client.conversations.replies({ channel, ts: threadTs, limit: 50 });
+    return (result.messages || [])
+      .filter(m => m.user && m.user !== botConfig.botUserId && m.ts !== currentTs && m.text)
+      .map(m => {
+        const txt = botPattern ? m.text.replace(botPattern, '').trim() : m.text;
+        return { user: m.user, text: txt.slice(0, 500) };
+      });
+  } catch (e) {
+    console.error('[mention] Failed to fetch full thread:', e.message);
+    return [];
+  }
+}
+
+async function fetchChannelHistory(client, channel, beforeTs) {
+  const botPattern = botConfig.botUserId ? new RegExp(`<@${botConfig.botUserId}>`, 'g') : null;
+  try {
+    const result = await client.conversations.history({ channel, latest: beforeTs, limit: 30, inclusive: false });
+    return (result.messages || [])
+      .filter(m => m.user && m.user !== botConfig.botUserId && m.text && !m.thread_ts)
+      .reverse()
+      .map(m => {
+        const txt = botPattern ? m.text.replace(botPattern, '').trim() : m.text;
+        return { user: m.user, text: txt.slice(0, 500) };
+      });
+  } catch (e) {
+    console.error('[mention] Failed to fetch channel history:', e.message);
+    return [];
+  }
+}
+
 async function fetchThreadContext(client, channel, thread_ts, currentTs) {
   if (!thread_ts) return [];
   try {
@@ -472,4 +590,64 @@ function extractUserId(raw) {
   return m ? m[1] : null;
 }
 
-module.exports = { handleMention, notificationTargetBlock };
+/**
+ * Passive monitoring: called for all non-bot messages containing @USER mentions.
+ * Auto-creates a reminder when a task + assignee + due_at can be extracted with high confidence.
+ */
+async function handlePassiveDetection({ message, client }) {
+  const { text, channel, ts, thread_ts, user } = message;
+
+  // Skip if this thread already has a reminder being managed
+  if (thread_ts) {
+    const existing = findByThreadTs(channel, thread_ts);
+    if (existing) return;
+  }
+
+  let extraction;
+  try {
+    extraction = await extractReminder(text, new Date(), []);
+  } catch (err) {
+    console.error('[passive] extractReminder error:', err.message);
+    return;
+  }
+
+  if (!extraction.should_create_reminder) return;
+  if (extraction.confidence < 0.85) return;
+  if (extraction.missing_fields?.length > 0) return;
+  if (!extraction.due_at) return;
+
+  const { assigneeSlackUserId, assigneeName } = resolveAssignee(extraction.assignee);
+  if (!assigneeSlackUserId && !assigneeName) return;
+
+  const replyThreadTs = thread_ts || ts;
+
+  try {
+    const reminderId = createReminder({
+      task: extraction.task,
+      assigneeName,
+      assigneeSlackUserId,
+      dueAt: extraction.due_at,
+      sourceChannelId: channel,
+      sourceMessageTs: ts,
+      sourceThreadTs: replyThreadTs,
+      createdBy: user,
+      confidence: extraction.confidence,
+      advanceNoticeHours: extraction.advance_notice_hours ?? null,
+      notificationTarget: 'dm',
+    });
+    approveReminder(reminderId);
+
+    const assigneeDisplay = await silentAssigneeDisplay(client, assigneeSlackUserId, assigneeName);
+    const confirmMsg = await client.chat.postMessage({
+      channel,
+      thread_ts: replyThreadTs,
+      text: `🔔 リマインドを自動登録しました。\n担当: ${assigneeDisplay}　期限: ${formatDueAt(extraction.due_at)}\n内容: ${extraction.task}\n\n_❌ リアクションでキャンセル_`,
+    });
+    setConfirmationTs(reminderId, confirmMsg.ts);
+    await client.reactions.add({ channel, timestamp: confirmMsg.ts, name: 'x' });
+  } catch (err) {
+    console.error('[passive] createReminder error:', err.message);
+  }
+}
+
+module.exports = { handleMention, notificationTargetBlock, handlePassiveDetection };

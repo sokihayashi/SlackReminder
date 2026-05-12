@@ -2,7 +2,7 @@ require('dotenv').config();
 
 const { App, LogLevel } = require('@slack/bolt');
 const botConfig = require('./botConfig');
-const { handleMention, notificationTargetBlock } = require('./handlers/mention');
+const { handleMention, notificationTargetBlock, handlePassiveDetection } = require('./handlers/mention');
 const { handleReaction } = require('./handlers/reaction');
 const { startScheduler } = require('./scheduler');
 
@@ -89,6 +89,18 @@ app.message(async ({ message, client }) => {
   // Skip messages that mention the bot (handled by app_mention)
   if (message.text && message.text.includes(`<@${botConfig.botUserId}>`)) return;
   await handleThreadReply({ message, client });
+});
+
+// Passive monitoring: auto-detect task assignments (@USER + deadline) in all channel messages
+app.message(async ({ message, client }) => {
+  if (!message.user || message.subtype === 'bot_message') return;
+  if (message.user === botConfig.botUserId) return;
+  if (!message.text) return;
+  // Skip messages mentioning the bot (handled by app_mention)
+  if (message.text.includes(`<@${botConfig.botUserId}>`)) return;
+  // Only process messages containing an explicit @USER mention
+  if (!/<@U[A-Z0-9]+>/.test(message.text)) return;
+  await handlePassiveDetection({ message, client });
 });
 
 (async () => {

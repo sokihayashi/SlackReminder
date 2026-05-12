@@ -31,7 +31,7 @@ function parseJSON(raw) {
 const VALID_INTENTS = [
   'create_reminder', 'query_tasks', 'cancel_reminder',
   'update_setting', 'set_summary_channel', 'remove_summary_channel',
-  'show_settings', 'none',
+  'show_settings', 'extract_from_thread', 'none',
 ];
 
 function sanitizeExtraction(raw) {
@@ -107,10 +107,14 @@ Intent options:
 - "remove_summary_channel": user wants to stop summary in this channel
   (e.g. サマリーを解除, 週次まとめを止めて)
 - "show_settings": user wants to see current settings (e.g. 設定確認, 現在の設定)
+- "extract_from_thread": user wants bot to scan this thread or channel and bulk-register all action items as reminders
+  (e.g. このスレッドのタスクを登録して, やること一覧にして しめきり切って, スレッドからタスク拾って, スレッド内で発生しているタスクを一覧にして, このスレッドのやることまとめて, このチャンネルのタスクを抽出して, 最近のメッセージからタスクを拾って, botがメンションされてないタスクも含めて)
+  → use when user wants to EXTRACT NEW tasks from conversation, NOT list reminders already in the system
+  → set should_create_reminder: false
 - "none": casual conversation or unclear
 
 Respond with JSON:
-- intent: "create_reminder" | "query_tasks" | "cancel_reminder" | "update_setting" | "set_summary_channel" | "remove_summary_channel" | "show_settings" | "none"
+- intent: "create_reminder" | "query_tasks" | "cancel_reminder" | "update_setting" | "set_summary_channel" | "remove_summary_channel" | "show_settings" | "extract_from_thread" | "none"
 - cancel_assignee: string or null
 - cancel_task_hint: string or null
 - query_assignee: string or null
@@ -212,4 +216,55 @@ Respond with JSON:
   return parseJSON(response.choices[0].message.content);
 }
 
-module.exports = { extractReminder, extractModification, resolveCancelTarget };
+/**
+ * Extract all action items from a thread conversation and return them as task objects.
+ * @param {{user: string, text: string}[]} threadMessages
+ * @param {Date} referenceDate
+ */
+async function extractTasksFromThread(threadMessages, referenceDate = new Date(), botUserId = null) {
+  if (threadMessages.length === 0) return [];
+
+  const jstNow = formatJST(referenceDate);
+  const thread = threadMessages.map(m => `[${m.user}]: ${m.text}`).join('\n');
+  const botNote = botUserId ? `\n- ※ <@${botUserId}> は Reminder Bot 自身なので担当者にしないこと` : '';
+
+  const response = await client.chat.completions.create({
+    model: MODEL,
+    max_tokens: 2048,
+    response_format: { type: 'json_object' },
+    messages: [
+      {
+        role: 'system',
+        content: `あなたはSlack会話からアクションアイテムを抽出するアシスタントです。
+Today's date and time (JST): ${jstNow}
+
+以下の会話から、タスク・依頼・やること（〜してください、〜お願い、〜確認して、〜借りる、〜確保する など）をすべて抽出してください。
+単なるメモや情報共有（「〜あるとなおよし」「〜がある」など）はタスクではありません。
+
+重要: 1つのメッセージに複数のタスクが含まれる場合は、それぞれ別のエントリとして返すこと。
+例: 「〜を借りてください。〜も確保してください。〜を確認してほしい」→ 3つのエントリ
+
+各タスクについて:
+- task: 具体的なタスク内容（簡潔に、動詞で終わる形で）
+- assignee: 担当者（<@UXXXXXX> 形式。名前のみの場合はそのまま。メッセージの宛先 (<@U...>) を優先。不明な場合は null）${botNote}
+- due_at: 期限（ISO 8601 JST offset, e.g. "2026-05-20T10:00:00+09:00"）。会話中の日付・「15日」「来週」などから推測。不明な場合は null
+- confidence: タスクである確信度 0.0-1.0
+
+Respond with JSON:
+{ "tasks": [ { "task": string, "assignee": string|null, "due_at": string|null, "confidence": number } ] }
+
+タスクが見つからない場合は { "tasks": [] } を返す。`,
+      },
+      {
+        role: 'user',
+        content: `スレッド:\n${thread}`,
+      },
+    ],
+  });
+
+  const parsed = parseJSON(response.choices[0].message.content);
+  if (!Array.isArray(parsed.tasks)) return [];
+  return parsed.tasks.filter(t => typeof t.task === 'string' && t.task.length > 0);
+}
+
+module.exports = { extractReminder, extractModification, resolveCancelTarget, extractTasksFromThread };
