@@ -4,6 +4,7 @@ const {
   getAllPending, getPendingByAssignee, cancelReminder, approveReminder,
   getSetting, setSetting, getAllSettings,
   savePendingQuestion, deletePendingQuestion, findByThreadTs,
+  findAllByConfirmationTs,
 } = require('../db');
 const { formatDueAt, formatHours, computeAdvanceNoticeHours, displayAssignee, silentAssigneeDisplay, silentDisplayAssignee, getDisplayName, CONFIDENCE_THRESHOLD, DEFAULT_ADVANCE_NOTICE_HOURS } = require('../utils');
 const botConfig = require('../botConfig');
@@ -66,6 +67,7 @@ async function handleMention({ event, client, priorText = null, silentOnNone = f
       const missing = extraction.missing_fields?.length > 0
         ? extraction.missing_fields.join('、')
         : '日時または担当者';
+      const needsDueAt = extraction.missing_fields?.includes('due_at') || extraction.missing_fields?.includes('日時');
       savePendingQuestion({
         channelId: channel,
         threadTs: replyThreadTs,
@@ -73,10 +75,28 @@ async function handleMention({ event, client, priorText = null, silentOnNone = f
         sourceMessageTs: ts,
         createdBy: user,
       });
+      const blocks = [
+        {
+          type: 'section',
+          text: { type: 'mrkdwn', text: `リマインドの作成に必要な情報が不足しています。\n不足情報：*${missing}*` },
+        },
+      ];
+      if (needsDueAt) {
+        blocks.push({
+          type: 'section',
+          text: { type: 'mrkdwn', text: '*期限を選択するか、スレッド返信で詳細を教えてください：*' },
+        });
+        blocks.push(quickDueAtActionsBlock());
+      }
+      blocks.push({
+        type: 'context',
+        elements: [{ type: 'mrkdwn', text: '_スレッド返信例: 「明日 17時」「今週金曜まで」「@田中」など（メンション不要）_' }],
+      });
       await client.chat.postMessage({
         channel,
         thread_ts: replyThreadTs,
-        text: `リマインドの作成に必要な情報が不足しています。\n不足情報：*${missing}*\n\nこのスレッドに返信して詳細を教えてください（メンション不要）。`,
+        text: `リマインドの作成に必要な情報が不足しています。不足情報：${missing}`,
+        blocks,
       });
       return;
     }
@@ -445,6 +465,35 @@ function bulkConfirmBlocks(entries) {
   return blocks;
 }
 
+/**
+ * Rebuilds the bulk confirmation Block Kit message from current DB state.
+ * Used after approve/cancel/modify actions to keep the message in sync.
+ */
+async function refreshBulkMessage(client, channel, ts) {
+  const reminders = findAllByConfirmationTs(channel, ts);
+  if (reminders.length === 0) return;
+  const entries = await Promise.all(reminders.map(async (r, i) => ({
+    id: r.id,
+    index: i + 1,
+    task: r.task,
+    assigneeDisplay: await silentAssigneeDisplay(client, r.assignee_slack_user_id, r.assignee_name),
+    dueAt: r.due_at,
+    hasDefaultDue: false,
+    advanceNoticeHours: r.advance_notice_hours,
+    _status: r.status === 'pending' ? 'pending' : r.status === 'cancelled' ? 'cancelled' : 'draft',
+  })));
+  const blocks = bulkConfirmBlocks(entries);
+  const draftCount = entries.filter(e => e._status === 'draft').length;
+  const headerText = draftCount > 0
+    ? `📋 ${entries.length} 件のリマインド候補。${draftCount} 件未確定。`
+    : `📋 ${entries.length} 件のリマインドを処理しました。`;
+  try {
+    await client.chat.update({ channel, ts, text: headerText, blocks });
+  } catch (e) {
+    console.error('[refreshBulkMessage] update failed:', e.message);
+  }
+}
+
 async function handleExtractFromThread(channel, threadTs, replyThreadTs, currentTs, user, client) {
   const messages = threadTs
     ? await fetchFullThread(client, channel, threadTs, currentTs)
@@ -661,6 +710,25 @@ function notificationTargetBlock(current) {
   if (current === 'dm') dm.style = 'primary';
   else thread.style = 'primary';
   return { type: 'actions', elements: [dm, thread] };
+}
+
+function quickDueAtActionsBlock() {
+  const options = [
+    { label: '今日 17時', value: '今日 17時' },
+    { label: '明日 10時', value: '明日 10時' },
+    { label: '明日 18時', value: '明日 18時' },
+    { label: '今週金曜 17時', value: '今週金曜 17時' },
+    { label: '来週月曜 10時', value: '来週月曜 10時' },
+  ];
+  return {
+    type: 'actions',
+    elements: options.map(o => ({
+      type: 'button',
+      text: { type: 'plain_text', text: o.label },
+      value: o.value,
+      action_id: 'set_due_at_quick',
+    })),
+  };
 }
 
 function advanceNoticeActionsBlock() {
@@ -1030,4 +1098,4 @@ async function handleBotJoinedChannel({ event, client }) {
   });
 }
 
-module.exports = { handleMention, notificationTargetBlock, handlePassiveDetection, handleBotJoinedChannel, bulkConfirmBlocks };
+module.exports = { handleMention, notificationTargetBlock, handlePassiveDetection, handleBotJoinedChannel, bulkConfirmBlocks, refreshBulkMessage };
