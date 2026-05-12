@@ -41,7 +41,11 @@ async function handleMention({ event, client, priorText = null }) {
       case 'set_summary_channel':   return handleSetSummaryChannel(channel, replyThreadTs, client);
       case 'remove_summary_channel':return handleRemoveSummaryChannel(channel, replyThreadTs, client);
       case 'show_settings':         return handleShowSettings(channel, replyThreadTs, client);
-      case 'extract_from_thread':   return handleExtractFromThread(channel, thread_ts, replyThreadTs, ts, user, client);
+      case 'extract_from_thread':
+        if (extraction.channel_scope === 'all') {
+          return handleExtractFromAllChannels(channel, replyThreadTs, ts, user, client);
+        }
+        return handleExtractFromThread(channel, thread_ts, replyThreadTs, ts, user, client);
     }
 
     if (!extraction.should_create_reminder) {
@@ -351,6 +355,104 @@ async function handleExtractFromThread(channel, threadTs, replyThreadTs, current
   });
 }
 
+async function handleExtractFromAllChannels(originChannel, replyThreadTs, currentTs, user, client) {
+  await client.chat.postMessage({
+    channel: originChannel,
+    thread_ts: replyThreadTs,
+    text: '🔍 入っている全チャンネルをスキャン中…（チャンネル数によっては数十秒かかります）',
+  });
+
+  const channels = await fetchAllChannelsHistory(client);
+  if (channels.length === 0) {
+    await client.chat.postMessage({
+      channel: originChannel,
+      thread_ts: replyThreadTs,
+      text: 'スキャン対象のチャンネルが見つかりませんでした。bot がメンバーになっているチャンネルがあるか確認してください。',
+    });
+    return;
+  }
+
+  const perChannel = await Promise.all(channels.map(async (ch) => {
+    try {
+      const tasks = await extractTasksFromThread(ch.messages, new Date(), botConfig.botUserId);
+      return { ...ch, tasks: tasks.filter(t => t.confidence >= 0.5) };
+    } catch (e) {
+      console.error(`[all-channels] extract failed for #${ch.channelName}:`, e.message);
+      return { ...ch, tasks: [] };
+    }
+  }));
+
+  const defaultDueAt = (() => {
+    const d = new Date();
+    d.setDate(d.getDate() + 7);
+    const jst = new Date(d.getTime() + 9 * 60 * 60 * 1000);
+    const y = jst.getUTCFullYear();
+    const mo = String(jst.getUTCMonth() + 1).padStart(2, '0');
+    const da = String(jst.getUTCDate()).padStart(2, '0');
+    return `${y}-${mo}-${da}T10:00:00+09:00`;
+  })();
+
+  const results = [];
+  for (const ch of perChannel) {
+    for (const t of ch.tasks) {
+      const { assigneeSlackUserId, assigneeName } = resolveAssignee(t.assignee);
+      if (!assigneeSlackUserId && !assigneeName) continue;
+      const dueAt = t.due_at || defaultDueAt;
+      const hasDefaultDue = !t.due_at;
+      try {
+        const id = createReminder({
+          task: t.task,
+          assigneeName,
+          assigneeSlackUserId,
+          dueAt,
+          sourceChannelId: ch.channelId,
+          sourceMessageTs: currentTs,
+          sourceThreadTs: null,
+          createdBy: user,
+          confidence: t.confidence,
+          advanceNoticeHours: null,
+          notificationTarget: 'dm',
+        });
+        approveReminder(id);
+        const assigneeDisplay = await silentAssigneeDisplay(client, assigneeSlackUserId, assigneeName);
+        results.push({ channelName: ch.channelName, task: t.task, assigneeDisplay, dueAt, hasDefaultDue });
+      } catch (err) {
+        console.error('[all-channels] createReminder error:', err.message);
+      }
+    }
+  }
+
+  if (results.length === 0) {
+    await client.chat.postMessage({
+      channel: originChannel,
+      thread_ts: replyThreadTs,
+      text: `🔍 ${channels.length} チャンネルをスキャンしましたが、タスクは見つかりませんでした。`,
+    });
+    return;
+  }
+
+  const byChannel = new Map();
+  for (const r of results) {
+    if (!byChannel.has(r.channelName)) byChannel.set(r.channelName, []);
+    byChannel.get(r.channelName).push(r);
+  }
+
+  const sections = [];
+  for (const [chName, items] of byChannel) {
+    const lines = items.map((r, i) => {
+      const dueNote = r.hasDefaultDue ? '　_※期限未指定のため1週間後_' : '';
+      return `　${i + 1}. ✅ *${r.task}*\n　　　担当: ${r.assigneeDisplay}　期限: ${formatDueAt(r.dueAt)}${dueNote}`;
+    });
+    sections.push(`*#${chName}*\n${lines.join('\n')}`);
+  }
+
+  await client.chat.postMessage({
+    channel: originChannel,
+    thread_ts: replyThreadTs,
+    text: `📋 ${channels.length} チャンネルから *${results.length} 件* のリマインドを登録しました。\n\n${sections.join('\n\n')}\n\n_キャンセルは「@Reminder Bot ○○のリマインドキャンセル」_`,
+  });
+}
+
 async function handleUpdateSetting(extraction, channel, replyThreadTs, client) {
   const { setting_key: key, setting_value: value } = extraction;
 
@@ -556,6 +658,40 @@ async function fetchChannelHistory(client, channel, beforeTs) {
       });
   } catch (e) {
     console.error('[mention] Failed to fetch channel history:', e.message);
+    return [];
+  }
+}
+
+async function fetchAllChannelsHistory(client) {
+  const botPattern = botConfig.botUserId ? new RegExp(`<@${botConfig.botUserId}>`, 'g') : null;
+  try {
+    const list = await client.conversations.list({
+      types: 'public_channel,private_channel',
+      exclude_archived: true,
+      limit: 200,
+    });
+    const memberChannels = (list.channels || []).filter(c => c.is_member);
+
+    const perChannel = await Promise.all(memberChannels.map(async (ch) => {
+      try {
+        const r = await client.conversations.history({ channel: ch.id, limit: 100 });
+        const messages = (r.messages || [])
+          .filter(m => m.user && m.user !== botConfig.botUserId && m.text && !m.thread_ts)
+          .reverse()
+          .map(m => {
+            const txt = botPattern ? m.text.replace(botPattern, '').trim() : m.text;
+            return { user: m.user, text: txt.slice(0, 500) };
+          });
+        return { channelId: ch.id, channelName: ch.name, messages };
+      } catch (e) {
+        console.error(`[all-channels] history failed for #${ch.name}:`, e.message);
+        return { channelId: ch.id, channelName: ch.name, messages: [] };
+      }
+    }));
+
+    return perChannel.filter(p => p.messages.length > 0);
+  } catch (e) {
+    console.error('[all-channels] conversations.list failed:', e.message);
     return [];
   }
 }

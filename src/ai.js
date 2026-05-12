@@ -46,6 +46,7 @@ function sanitizeExtraction(raw) {
     reason:               raw.reason              ?? null,
     advance_notice_hours: Number.isFinite(raw.advance_notice_hours) ? raw.advance_notice_hours : null,
     notification_target:  raw.notification_target === 'thread' ? 'thread' : 'dm',
+    channel_scope:        raw.channel_scope === 'all' ? 'all' : 'current',
     query_assignee:       raw.query_assignee      ?? null,
     cancel_assignee:      raw.cancel_assignee     ?? null,
     cancel_task_hint:     raw.cancel_task_hint    ?? null,
@@ -108,9 +109,10 @@ Intent options:
   (e.g. サマリーを解除, 週次まとめを止めて)
 - "show_settings": user wants to see current settings (e.g. 設定確認, 現在の設定)
 - "extract_from_thread": user wants bot to scan this thread or channel and bulk-register all action items as reminders
-  (e.g. このスレッドのタスクを登録して, やること一覧にして しめきり切って, スレッドからタスク拾って, スレッド内で発生しているタスクを一覧にして, このスレッドのやることまとめて, このチャンネルのタスクを抽出して, 最近のメッセージからタスクを拾って, botがメンションされてないタスクも含めて)
+  (e.g. このスレッドのタスクを登録して, やること一覧にして しめきり切って, スレッドからタスク拾って, スレッド内で発生しているタスクを一覧にして, このスレッドのやることまとめて, このチャンネルのタスクを抽出して, 最近のメッセージからタスクを拾って, botがメンションされてないタスクも含めて, 全チャンネルからタスク抽出, 入ってるチャンネル全部からタスク, 全てのチャンネルをスキャン)
   → use when user wants to EXTRACT NEW tasks from conversation, NOT list reminders already in the system
   → set should_create_reminder: false
+  → channel_scope: "all" if user explicitly wants to scan all channels the bot is a member of (e.g. 全チャンネル, 入ってる全チャンネル, 全部のチャンネル, all channels, 全てのチャンネル). Otherwise "current".
 - "none": casual conversation or unclear
 
 Respond with JSON:
@@ -126,6 +128,7 @@ Respond with JSON:
 - due_at: string or null
 - advance_notice_hours: integer or null (per-reminder override; null = use global default)
 - notification_target: "dm" | "thread"
+- channel_scope: "current" | "all"
 - confidence: number 0.0-1.0
 - missing_fields: array of strings
 - reason: string or null`,
