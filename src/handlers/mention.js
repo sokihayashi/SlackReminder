@@ -118,7 +118,7 @@ async function handleMention({ event, client, priorText = null, silentOnNone = f
 
     deletePendingQuestion(channel, replyThreadTs);
 
-    const notifTarget = extraction.notification_target === 'thread' ? 'thread' : 'dm';
+    const notifTarget = extraction.notification_target === 'dm' ? 'dm' : 'thread';
 
     if (extraction.tasks.length === 1) {
       return postSingleConfirmation(extraction.tasks[0], notifTarget, channel, ts, replyThreadTs, user, client);
@@ -591,7 +591,7 @@ async function handleExtractFromAllChannels(originChannel, replyThreadTs, curren
     if (newTasksHere.length === 0) continue;
 
     const r = await bulkCreateReminders(newTasksHere, {
-      channelId: originChannel, messageTs: currentTs, threadTs: replyThreadTs, user, notificationTarget: 'dm',
+      channelId: originChannel, messageTs: currentTs, threadTs: replyThreadTs, user, notificationTarget: 'thread',
     }, client, { approve: false });
     for (const item of r.filter(x => x.status === 'created')) {
       newDrafts.push({ channelName: ch.channelName, ...item });
@@ -1061,7 +1061,7 @@ async function handlePassiveDetection({ message, client }) {
   if (valid.length === 0) return;
 
   const results = await bulkCreateReminders(valid, {
-    channelId: channel, messageTs: ts, threadTs: replyThreadTs, user, notificationTarget: 'dm',
+    channelId: channel, messageTs: ts, threadTs: replyThreadTs, user, notificationTarget: 'thread',
   }, client);
   const created = results.filter(r => r.status === 'created');
   if (created.length === 0) return;
