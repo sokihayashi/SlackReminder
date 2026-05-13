@@ -54,7 +54,7 @@ async function deleteBotMessagesInConversation(client, channelId, { maxPages = 5
       break;
     }
     for (const m of (r.messages || [])) {
-      const isBotMsg = m.user === botConfig.botUserId || m.bot_id;
+      const isBotMsg = m.user === botConfig.botUserId;
       if (isBotMsg) {
         try {
           await client.chat.delete({ channel: channelId, ts: m.ts });
@@ -89,7 +89,7 @@ async function deleteBotRepliesInThread(client, channelId, threadTs) {
     }
     for (const reply of (rr.messages || [])) {
       if (reply.ts === threadTs) continue;
-      if (reply.user !== botConfig.botUserId && !reply.bot_id) continue;
+      if (reply.user !== botConfig.botUserId) continue;
       try {
         await client.chat.delete({ channel: channelId, ts: reply.ts });
         deleted++;
