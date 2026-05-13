@@ -198,6 +198,14 @@ function getAllPending() {
     .all();
 }
 
+function getRecentlySentReminders(days = 7) {
+  const since = new Date(Date.now() - days * 24 * 3600 * 1000).toISOString();
+  return db.prepare(`
+    SELECT * FROM reminders WHERE status = 'sent' AND updated_at >= ?
+    ORDER BY due_at ASC
+  `).all(since);
+}
+
 function getPendingByAssignee(slackUserId) {
   return db.prepare(`
     SELECT * FROM reminders
@@ -236,7 +244,7 @@ function updateReminder(id, { assigneeName, assigneeSlackUserId, dueAt, advanceN
 
 // ── Pending questions ───────────────────────────────────────────────────────
 
-const PENDING_QUESTION_TTL_MS = 60 * 60 * 1000; // 1 hour
+const PENDING_QUESTION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 function savePendingQuestion({ channelId, threadTs, originalText, sourceMessageTs, createdBy }) {
   db.prepare(`
@@ -330,6 +338,7 @@ module.exports = {
   markSent,
   markFailed,
   getAllPending,
+  getRecentlySentReminders,
   getPendingByAssignee,
   findByThreadTs,
   getReminderById,

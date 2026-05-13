@@ -11,12 +11,13 @@ const engagedThreadsCache = new Map();
 async function isBotEngagedInThread(client, channel, thread_ts) {
   if (!botConfig.botUserId) return false;
   const key = `${channel}:${thread_ts}`;
-  if (engagedThreadsCache.has(key)) return engagedThreadsCache.get(key);
+  if (engagedThreadsCache.get(key) === true) return true;
 
   try {
     const result = await client.conversations.replies({ channel, ts: thread_ts, limit: 100 });
     const engaged = (result.messages || []).some(m => m.user === botConfig.botUserId);
-    engagedThreadsCache.set(key, engaged);
+    // Only cache positive results — negative results can become stale if the bot posts later
+    if (engaged) engagedThreadsCache.set(key, true);
     return engaged;
   } catch (e) {
     console.error('[thread] isBotEngagedInThread failed:', e.message);
