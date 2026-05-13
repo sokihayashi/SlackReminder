@@ -539,21 +539,8 @@ async function handleExtractFromThread(channel, threadTs, replyThreadTs, current
     return;
   }
 
-  const results = await bulkCreateReminders(filtered, {
-    channelId: channel, messageTs: currentTs, threadTs: replyThreadTs, user, notificationTarget: 'dm',
-  }, client);
-
-  const created = results.filter(r => r.status === 'created');
-  if (created.length === 0) {
-    await client.chat.postMessage({ channel, thread_ts: replyThreadTs, text: 'タスクの登録に失敗しました。' });
-    return;
-  }
-
-  const scope = threadTs ? 'スレッド' : 'チャンネル';
-  await client.chat.postMessage({
-    channel, thread_ts: replyThreadTs,
-    text: `📋 ${scope}から *${created.length} 件* のリマインドを登録しました。\n\n${formatBulkLines(results).join('\n\n')}\n\n_キャンセルは「@Reminder Bot ○○のリマインドキャンセル」_`,
-  });
+  // Draft mode: show confirmation UI before any DMs fire
+  return postBulkCreate(filtered, 'dm', channel, currentTs, replyThreadTs, user, client);
 }
 
 async function handleExtractFromAllChannels(originChannel, replyThreadTs, currentTs, user, client, { fullHistory = false } = {}) {
@@ -1113,16 +1100,8 @@ async function handleBotJoinedChannel({ event, client }) {
   const filtered = tasks.filter(t => t.confidence >= 0.5);
   if (filtered.length === 0) return;
 
-  const results = await bulkCreateReminders(filtered, {
-    channelId: channel, messageTs: null, threadTs: null, user: botConfig.botUserId, notificationTarget: 'dm',
-  }, client);
-  const created = results.filter(r => r.status === 'created');
-  if (created.length === 0) return;
-
-  await client.chat.postMessage({
-    channel,
-    text: `🔔 過去メッセージから *${created.length} 件* のリマインドを自動登録しました。\n\n${formatBulkLines(results).join('\n\n')}\n\n_誤検出は「@Reminder Bot ○○のリマインドキャンセル」で削除できます。_`,
-  });
+  // Draft mode: require manager confirmation before DMs fire
+  await postBulkCreate(filtered, 'dm', channel, null, null, botConfig.botUserId, client);
 }
 
 module.exports = { handleMention, notificationTargetBlock, handlePassiveDetection, handleBotJoinedChannel, bulkConfirmBlocks, refreshBulkMessage };
