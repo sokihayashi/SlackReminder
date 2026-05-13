@@ -145,6 +145,12 @@ Intent options:
   → Interpret relative dates (明日, 来週, 今週中) from JST time above; default time 10:00 JST
   → "前日にリマインド" → subtract one day from due_at
   → Ambiguous date → confidence < 0.6, add "due_at" to missing_fields
+  → **CONFIDENCE SCORING（重要・厳守）**:
+    - 0.9以上: 全タスクに <@U...> 形式のassigneeがあり、かつ全タスクにdue_atが確定できる
+    - 0.85以上: 全タスクに <@U...> 形式のassigneeがあり、due_atは絵文字・日付表現から推測できる
+    - 0.7以上: assigneeが名前のみ（<@U...>なし）だがdue_atは明確
+    - 0.6未満: assigneeが一切なし、またはdue_atが完全に不明
+    - **<@U...> 形式のメンションが1つ以上あればconfidenceは0.85以上にすること**
   → カスタム絵文字（:emoji_name: 形式）も期限ヒントとして解釈（**重要**: 日付絵文字を見つけたら必ずdue_atに反映すること）：
     【日付指定】
     - :asitakana: :asitayaro: :asitamatakite: :asita_tantou: :ashita: :ashitadeok: :ashitanokoban: :ashitayaru_明日_やる: → 翌日 23:59 JST
