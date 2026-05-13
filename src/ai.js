@@ -137,8 +137,18 @@ Intent options:
     Example: 「QKからインカム借りて、段ボール確保、15日に制作チームに確認」 → 3 entries
   → If the user message lacks task details (e.g. just 「登録して」「リマインドして」「お願い」), look at Thread context above and extract action items discussed there.
   → **ASSIGNEE EXTRACTION (重要・厳守)**: The user's bot mention has already been stripped from the input.
-    - Rule A: Any <@UXXXXXXX> appearing in the user's message OR in thread context IS a valid assignee. Copy verbatim (e.g. "<@U12345>"). Self-reminders (sender == mentioned user) are valid.
-    - Rule B: Plain Japanese names addressed to a person ("はやしさん", "田中", "@山田") in the message or thread context also count — use the name as a string.
+    - Rule A: Any <@UXXXXXXX> appearing in the user's message OR in thread context IS a valid assignee. Copy verbatim (e.g. "<@U12345>").
+      **担当者スコープルール（複数タスク・複数メンション時の判定基準）**:
+      1. 前置スコープ: ある <@Ux> の後に続くタスク群は、次の別メンションが出るまで <@Ux> を担当者とする。
+         例: "<@U1> AとB、<@U2> CとD" → A,B→<@U1>; C,D→<@U2>
+         例: "<@U1> AしてBして" → A→<@U1>, B→<@U1>
+      2. 後置スコープ: タスク直後に宛先メンションが来る場合も、そのタスクの担当者とする。
+         例: "Aして <@U1>、Bして <@U2>" → A→<@U1>, B→<@U2>
+      3. 並列メンション: 「<@U1> と <@U2>」「<@U1><@U2>」のように複数人が並んで同一タスクを指す場合は、タスクを人数分複製してそれぞれに割り当てる。
+         例: "<@U1> と <@U2> タスクA やっておいて" → {task:A, assignee:<@U1>}, {task:A, assignee:<@U2>}
+      4. 単一メンション複数タスク: メンションが1つだけで複数タスクがある場合は全タスクを同じ担当者にする。
+         例: "<@U1> A、B、C" → A,B,C全て→<@U1>
+    - Rule B: Plain Japanese names addressed to a person ("はやしさん", "田中", "@山田") in the message or thread context also count — use the name as a string. Apply the same scope rules as Rule A.
     - Rule C: When the current message is empty / just a bot mention / vague ("登録して" "お願い" "リマインドして"), TREAT this as "register the parent thread message as a reminder". Search the thread parent + recent thread messages for assignees and tasks. Inheriting the parent's <@UXXX> as assignee is the EXPECTED behavior — do not return missing_fields=["assignee"] in this case.
     - Never use the bot as assignee.
     - Only flag "assignee" as missing when there is literally no <@U> mention and no addressed name anywhere in the message OR thread context. Be liberal: if there's ANY ambiguity, infer from thread context rather than flagging missing.
@@ -322,7 +332,12 @@ Today's date and time (JST): ${jstNow}
 
 各タスクについて:
 - task: 具体的なタスク内容（簡潔に、動詞で終わる形で）
-- assignee: 担当者（<@UXXXXXX> 形式。名前のみの場合はそのまま。メッセージの宛先 (<@U...>) を優先。不明な場合は null）${botNote}
+- assignee: 担当者（<@UXXXXXX> 形式。名前のみの場合はそのまま。不明な場合は null）${botNote}
+  **担当者スコープルール**:
+  1. 前置スコープ: <@Ux> の後に続くタスク群は次のメンションまで <@Ux> が担当。例: "<@U1> AとB、<@U2> C" → A,B→<@U1>, C→<@U2>
+  2. 後置スコープ: タスク直後に宛先メンションがあれば担当者とする。例: "A作業 <@U1>、B作業 <@U2>" → A→<@U1>, B→<@U2>
+  3. 並列メンション: 「<@U1> と <@U2>」のように複数人が並ぶ場合はタスクを複製してそれぞれに割り当てる。
+  4. 単一メンション複数タスク: メンションが1つなら全タスクを同じ担当者にする。
 - due_at: 期限（ISO 8601 JST offset, e.g. "2026-05-20T10:00:00+09:00"）。会話中の日付・「15日」「来週」などから推測。不明な場合は null
   カスタム絵文字（:emoji_name: 形式）も期限ヒントとして解釈（**重要**: 日付絵文字を見つけたら必ずdue_atに反映すること）：
   【日付指定】
