@@ -1051,29 +1051,33 @@ async function handlePassiveDetection({ message, client }) {
     return;
   }
 
-  if (extraction.intent !== 'create_reminder') return;
-  if (extraction.confidence < 0.85) return;
-  if (extraction.missing_fields?.length > 0) return;
+  if (extraction.intent !== 'create_reminder') {
+    console.log(`[passive] skip: intent=${extraction.intent}`);
+    return;
+  }
+  if (extraction.confidence < 0.85) {
+    console.log(`[passive] skip: confidence=${extraction.confidence} tasks=${JSON.stringify(extraction.tasks.map(t => t.task))}`);
+    return;
+  }
+  if (extraction.missing_fields?.length > 0) {
+    console.log(`[passive] skip: missing_fields=${extraction.missing_fields}`);
+    return;
+  }
   if (extraction.tasks.length === 0) return;
 
   const replyThreadTs = thread_ts || ts;
   const valid = extraction.tasks.filter(t => t.due_at && (resolveAssignee(t.assignee).assigneeSlackUserId || resolveAssignee(t.assignee).assigneeName));
-  if (valid.length === 0) return;
+  if (valid.length === 0) {
+    console.log(`[passive] skip: no valid tasks (due_at or assignee missing) tasks=${JSON.stringify(extraction.tasks.map(t => ({ task: t.task, due_at: t.due_at, assignee: t.assignee })))}`);
+    return;
+  }
 
-  const results = await bulkCreateReminders(valid, {
-    channelId: channel, messageTs: ts, threadTs: replyThreadTs, user, notificationTarget: 'thread',
-  }, client);
-  const created = results.filter(r => r.status === 'created');
-  if (created.length === 0) return;
-
-  const summary = created.length === 1
-    ? `🔔 リマインドを自動登録しました。\n担当: ${created[0].assigneeDisplay}　期限: ${formatDueAt(created[0].dueAt)}\n内容: ${created[0].task}`
-    : `🔔 ${created.length} 件のリマインドを自動登録しました。\n\n${formatBulkLines(results).join('\n\n')}`;
-
-  await client.chat.postMessage({
-    channel, thread_ts: replyThreadTs,
-    text: `${summary}\n\n_❌ で取消し、スレッド返信で修正可_`,
-  });
+  console.log(`[passive] showing confirmation for ${valid.length} task(s)`);
+  if (valid.length === 1) {
+    await postSingleConfirmation(valid[0], 'thread', channel, ts, replyThreadTs, user, client);
+  } else {
+    await postBulkCreate(valid, 'thread', channel, ts, replyThreadTs, user, client);
+  }
 }
 
 /**
