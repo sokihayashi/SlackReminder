@@ -1,7 +1,7 @@
 const { extractReminder, resolveCancelTarget, extractTasksFromThread } = require('../ai');
 const {
   createReminder, setConfirmationTs, setNotificationTarget,
-  getAllPending, getPendingByAssignee, cancelReminder, approveReminder,
+  getAllPending, getPendingByAssignee, getRecentlySentReminders, cancelReminder, approveReminder,
   getSetting, setSetting,
   savePendingQuestion, deletePendingQuestion, findByThreadTs,
   findAllByConfirmationTs,
@@ -139,32 +139,48 @@ async function handleMention({ event, client, priorText = null, silentOnNone = f
 
 async function handleTaskQuery(extraction, channel, replyThreadTs, client) {
   const queryUserId = extractUserId(extraction.query_assignee);
-  const reminders = queryUserId ? getPendingByAssignee(queryUserId) : getAllPending();
-  let headerText = 'ペンディングタスク一覧';
+  const pending = queryUserId ? getPendingByAssignee(queryUserId) : getAllPending();
+  const allSent = getRecentlySentReminders(7);
+  const sent = queryUserId ? allSent.filter(r => r.assignee_slack_user_id === queryUserId) : allSent;
+
+  let headerText = 'タスク一覧';
   if (queryUserId) {
     const name = await getDisplayName(client, queryUserId);
     headerText = `${name ? `@${name}` : 'ユーザー'} のタスク一覧`;
   }
 
-  if (reminders.length === 0) {
+  if (pending.length === 0 && sent.length === 0) {
     await client.chat.postMessage({
       channel,
       thread_ts: replyThreadTs,
-      text: `*${headerText}*\n\n現在ペンディング中のタスクはありません。`,
+      text: `*${headerText}*\n\n現在ペンディング中・直近通知済みのタスクはありません。`,
     });
     return;
   }
 
-  const lines = await Promise.all(reminders.map(async (r, i) => {
-    const assignee = await silentDisplayAssignee(client, r);
-    const statusLabel = r.status === 'draft' ? '未確認' : '確認済み';
-    return `${i + 1}. *${r.task}*\n　担当：${assignee}　期限：${formatDueAt(r.due_at)}　[${statusLabel}]`;
-  }));
+  const parts = [];
+
+  if (pending.length > 0) {
+    const lines = await Promise.all(pending.map(async (r, i) => {
+      const assignee = await silentDisplayAssignee(client, r);
+      const statusLabel = r.status === 'draft' ? '⏳未確認' : '✅確認済み';
+      return `${i + 1}. *${r.task}*\n　担当：${assignee}　期限：${formatDueAt(r.due_at)}　${statusLabel}`;
+    }));
+    parts.push(`*📌 ペンディング中 (${pending.length}件)*\n\n${lines.join('\n\n')}`);
+  }
+
+  if (sent.length > 0) {
+    const lines = await Promise.all(sent.map(async (r, i) => {
+      const assignee = await silentDisplayAssignee(client, r);
+      return `${i + 1}. *${r.task}*\n　担当：${assignee}　期限：${formatDueAt(r.due_at)}`;
+    }));
+    parts.push(`*📬 最近通知済み（過去7日・${sent.length}件）*\n\n${lines.join('\n\n')}`);
+  }
 
   await client.chat.postMessage({
     channel,
     thread_ts: replyThreadTs,
-    text: `*${headerText}*\n\n${lines.join('\n\n')}`,
+    text: `*${headerText}*\n\n${parts.join('\n\n---\n\n')}`,
   });
 }
 

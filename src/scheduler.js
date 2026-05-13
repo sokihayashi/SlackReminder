@@ -1,5 +1,5 @@
 const cron = require('node-cron');
-const { getPendingDueReminders, getUnnotifiedPendingReminders, getAllPending, markSent, markFailed, markAdvanceNotified, getSetting, setSetting } = require('./db');
+const { getPendingDueReminders, getUnnotifiedPendingReminders, getAllPending, getRecentlySentReminders, markSent, markFailed, markAdvanceNotified, getSetting, setSetting } = require('./db');
 const { formatDueAt, formatHours, displayAssignee, silentDisplayAssignee, DEFAULT_ADVANCE_NOTICE_HOURS } = require('./utils');
 
 const UNRECOVERABLE_CODES = ['user_not_found', 'user_disabled', 'account_inactive', 'no_such_channel'];
@@ -133,9 +133,7 @@ function buildAdvanceNoticeMessage(reminders, globalHours, isDm) {
   }).join('\n');
 
   return {
-    text: isDm
-      ? `⏰ 期限が近いタスクが ${reminders.length} 件あります。`
-      : `⏰ 期限が近いタスクが ${reminders.length} 件あります。`,
+    text: `⏰ 期限が近いタスクが ${reminders.length} 件あります。`,
     blocks: [{
       type: 'section',
       text: { type: 'mrkdwn', text: `${header}\n\n${lines}` },
@@ -215,9 +213,7 @@ function buildDueMessage(reminders, isDm) {
     };
   }
 
-  const header = isDm
-    ? `*リマインド：期限を迎えたタスクが ${reminders.length} 件あります。*`
-    : `*リマインド：期限を迎えたタスクが ${reminders.length} 件あります。*`;
+  const header = `*リマインド：期限を迎えたタスクが ${reminders.length} 件あります。*`;
 
   const lines = reminders.map((r, i) => {
     const srcLine = isDm ? `　依頼元: <#${r.source_channel_id}>` : '';
@@ -238,43 +234,52 @@ async function postWeeklySummary(client) {
   const channelId = getSetting('summary_channel_id', '');
   if (!channelId) return;
 
-  const reminders = getAllPending();
+  const pending = getAllPending();
+  const sent = getRecentlySentReminders(7);
   const today = new Date().toLocaleDateString('ja-JP', { timeZone: 'Asia/Tokyo', year: 'numeric', month: 'long', day: 'numeric', weekday: 'long' });
 
-  if (reminders.length === 0) {
+  if (pending.length === 0 && sent.length === 0) {
     await client.chat.postMessage({
       channel: channelId,
-      text: `📋 *週次タスクサマリー（${today}）*\n\n現在ペンディング中のタスクはありません。`,
+      text: `📋 *週次タスクサマリー（${today}）*\n\nペンディング中・直近通知済みのタスクはありません。`,
     });
     return;
   }
 
-  const lines = await Promise.all(reminders.map(async (r, i) => {
-    const assignee = await silentDisplayAssignee(client, r);
-    const statusLabel = r.status === 'draft' ? '⏳未確認' : '✅確認済み';
-    return `${i + 1}. *${r.task}*\n　担当：${assignee}　期限：${formatDueAt(r.due_at)}　${statusLabel}`;
-  }));
+  const blocks = [
+    { type: 'header', text: { type: 'plain_text', text: `📋 週次タスクサマリー（${today}）` } },
+  ];
+
+  if (pending.length > 0) {
+    const lines = await Promise.all(pending.map(async (r, i) => {
+      const assignee = await silentDisplayAssignee(client, r);
+      const statusLabel = r.status === 'draft' ? '⏳未確認' : '✅確認済み';
+      return `${i + 1}. *${r.task}*\n　担当：${assignee}　期限：${formatDueAt(r.due_at)}　${statusLabel}`;
+    }));
+    blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `*📌 ペンディング中 (${pending.length}件)*\n\n${lines.join('\n\n')}` } });
+  }
+
+  if (sent.length > 0) {
+    const sentLines = await Promise.all(sent.map(async (r, i) => {
+      const assignee = await silentDisplayAssignee(client, r);
+      return `${i + 1}. *${r.task}*\n　担当：${assignee}　期限：${formatDueAt(r.due_at)}`;
+    }));
+    blocks.push({ type: 'divider' });
+    blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `*📬 最近通知済み（過去7日・${sent.length}件）*\n\n${sentLines.join('\n\n')}` } });
+  }
+
+  blocks.push({
+    type: 'context',
+    elements: [{ type: 'mrkdwn', text: `ペンディング ${pending.length}件 / 通知済み ${sent.length}件` }],
+  });
 
   try {
     await client.chat.postMessage({
       channel: channelId,
-      text: `📋 *週次タスクサマリー（${today}）*\n\n${lines.join('\n\n')}`,
-      blocks: [
-        {
-          type: 'header',
-          text: { type: 'plain_text', text: `📋 週次タスクサマリー（${today}）` },
-        },
-        {
-          type: 'section',
-          text: { type: 'mrkdwn', text: lines.join('\n\n') },
-        },
-        {
-          type: 'context',
-          elements: [{ type: 'mrkdwn', text: `合計 ${reminders.length} 件のペンディングタスク` }],
-        },
-      ],
+      text: `📋 週次タスクサマリー（${today}）— ペンディング ${pending.length}件 / 通知済み ${sent.length}件`,
+      blocks,
     });
-    console.log(`[scheduler] Weekly summary posted to ${channelId} (${reminders.length} tasks)`);
+    console.log(`[scheduler] Weekly summary posted to ${channelId} (pending=${pending.length}, sent=${sent.length})`);
   } catch (err) {
     console.error(`[scheduler] Weekly summary failed for channel ${channelId}:`, err.message);
     if (isUnrecoverable(err)) {

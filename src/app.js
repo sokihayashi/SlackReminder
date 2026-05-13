@@ -7,7 +7,7 @@ const { executeReset } = require('./handlers/admin');
 const { handleReaction } = require('./handlers/reaction');
 const { startScheduler } = require('./scheduler');
 
-const { handleThreadReply } = require('./handlers/thread');
+const { handleThreadReply, markThreadEngaged } = require('./handlers/thread');
 const { setSetting, setNotificationTarget, findByConfirmationTs, approveReminder, cancelReminder, getPendingQuestion, deletePendingQuestion, recordBotSentMessage, getReminderById, updateReminder } = require('./db');
 const { formatHours, formatDueAt } = require('./utils');
 
@@ -38,6 +38,7 @@ app.client.chat.postMessage = async (opts) => {
   const result = await _origPostMessage(opts);
   if (result?.ok && result?.channel && result?.ts) {
     recordBotSentMessage(result.channel, result.ts);
+    if (opts.thread_ts) markThreadEngaged(result.channel, opts.thread_ts);
   }
   return result;
 };
@@ -347,8 +348,10 @@ app.message(async ({ message, client }) => {
   await handleThreadReply({ message, client });
 });
 
-// Passive monitoring: auto-detect task assignments (@USER + deadline) in all channel messages
+// Passive monitoring: auto-detect task assignments (@USER + deadline) in channel messages.
+// Thread replies are handled exclusively by handleThreadReply above.
 app.message(async ({ message, client }) => {
+  if (message.thread_ts) return;
   if (!message.user || message.subtype === 'bot_message') return;
   if (message.user === botConfig.botUserId) return;
   if (!message.text) return;
